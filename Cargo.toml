@@ -1,8 +1,44 @@
-[package]
-name = "main"
-version = "0.1.0"
-edition = "2021"
+use std::fs;
+use std::io::{self, Read};
+use serde_yaml::{Value, from_str};
 
-[dependencies]
-regex = "1"
-dotenv = "0.15"
+/// Normalize the YAML by removing extra spaces and ensuring consistent formatting
+fn normalize_yaml(input: &str) -> Result<String, serde_yaml::Error> {
+    // Parse the YAML content into a serde_yaml::Value (abstract representation)
+    let value: Value = from_str(input)?;
+
+    // Convert the normalized Value back into a string with consistent formatting
+    Ok(serde_yaml::to_string(&value)?)
+}
+
+/// Check if a normalized YAML block is present in a file
+fn contains_yaml_block(file_path: &str, block: &str) -> io::Result<bool> {
+    let mut file = fs::File::open(file_path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    // Normalize both file content and block
+    let normalized_contents = normalize_yaml(&contents).unwrap_or_default();
+    let normalized_block = normalize_yaml(block).unwrap_or_default();
+
+    Ok(normalized_contents.contains(&normalized_block))
+}
+
+fn main() -> io::Result<()> {
+    let file_path = "example.yaml";
+    let block = r#"
+    name: "John"
+    age: 30
+    address:
+      street: "123 Elm St"
+      city: "Somewhere"
+    "#;
+
+    if contains_yaml_block(file_path, block)? {
+        println!("The YAML block is present in the file.");
+    } else {
+        println!("The YAML block is not present in the file.");
+    }
+
+    Ok(())
+}
