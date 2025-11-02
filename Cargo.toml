@@ -1,10 +1,14 @@
 [package]
-name = "ai"
+name = "rustfileb"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.11", features = ["json"] }
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+ratatui = { version = "0.27.0", features = ["crossterm"] }
+crossterm = "0.27.0"
+thiserror = "1.0.63"
+ssh2 = "0.9"
+chrono = "0.4"
+nu-ansi-term = "0.49.0"
+infer = "0.13.0" # ADD THIS LINE
+users = "0.11.0"
