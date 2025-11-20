@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 from tkinter.messagebox import showerror
 
-# --- Configuration Globale ---
+# --- Configuration Globale ----
 NB_APPLICATIONS = 20
 NB_MODULES_PER_APP = 20
 OUTPUT_FILENAME = "generated_app_configs.txt" 
