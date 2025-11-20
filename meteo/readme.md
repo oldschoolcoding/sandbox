@@ -1,0 +1,4 @@
+DROP DATABASE IF EXISTS config_db;
+ALTER SCHEMA public OWNER TO mickael;
+GRANT ALL PRIVILEGES ON SCHEMA public TO mickael;
+CREATE DATABASE config_db OWNER mickael;

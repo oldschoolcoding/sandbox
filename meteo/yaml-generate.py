@@ -22,7 +22,8 @@ CYBERARK_FILENAME = "cyberark-configs.csv"
 KEY_PREFIX = "APP" 
 
 # Variables de connexion MISES À JOUR
-DB_URL_TEMPLATE = "postgresql://localhost:5432/{}" 
+#DB_URL_TEMPLATE = "postgresql://localhost:5432/{}" 
+DB_URL_TEMPLATE = "postgresql:///{}" 
 DB_NAME = "config_db" 
 # Chaîne de connexion UNIQUE utilisée partout pour la DB spécifique
 DB_URL = DB_URL_TEMPLATE.format(DB_NAME) 
