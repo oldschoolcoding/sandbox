@@ -1,5 +1,5 @@
- use std::os::unix::fs::PermissionsExt;
- use crossterm::{
+use std::os::unix::fs::PermissionsExt;
+use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -24,7 +24,7 @@ use users::{get_user_by_uid, get_group_by_gid};
 use regex::Regex;
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt; // ← This was missing!
+use std::os::unix::fs::MetadataExt;
 
 const CHUNK_SIZE: usize = 500;
 
@@ -149,7 +149,7 @@ impl FileSystemOperations for LocalFileSystem {
         };
         let modified = m.modified()
             .ok()
-            .map(|t| DateTime::<Local>::from(t)) // ← Fixed: removed unnecessary and_then
+            .map(|t| DateTime::<Local>::from(t))
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or("N/A".into());
 
@@ -308,13 +308,6 @@ impl App {
         Ok(app)
     }
 
-    fn get_server_name(&self) -> String {
-        self.fs_ops.as_any()
-            .downcast_ref::<SftpFileSystem>()
-            .map(|s| s.remote_host.clone())
-            .unwrap_or_else(|| "local".into())
-    }
-
     fn refresh_entries(&mut self) -> Result<(), AppError> {
         self.entries = self.fs_ops.read_dir(&self.current_path)?;
         self.entries.sort_by(|a, b| {
@@ -405,7 +398,37 @@ impl App {
         Ok(())
     }
 
-    fn search_at_depth(&self, path: &Path, re: &Regex, content: bool, out: &mut Vec<Line<'static>>, depth: usize, max_depth: usize) -> Result<(), AppError> {
+    // Unified result creation: both name and content matches use same format
+    fn add_name_match(&self, out: &mut Vec<Line<'static>>, full: &str, is_dir: bool) {
+        let path_display = if is_dir {
+            format!("{full}/")
+        } else {
+            full.to_owned()
+        };
+        let styled = if is_dir {
+            Span::styled(path_display, Style::default().fg(Color::Cyan))
+        } else {
+            Span::raw(path_display)
+        };
+        out.push(Line::from(vec![styled]));
+    }
+
+    fn add_content_match(&self, out: &mut Vec<Line<'static>>, full: &str, line_num: usize, line_text: &str, re: &Regex) {
+        let prefix = format!("{}:{:4}: ", full, line_num + 1);
+        let mut spans = vec![Span::raw(prefix)];
+
+        let mut last = 0;
+        for m in re.find_iter(line_text) {
+            spans.push(Span::raw(line_text[last..m.start()].to_owned()));
+            spans.push(Span::styled(line_text[m.range()].to_owned(), Style::default().fg(Color::Red)));
+            last = m.end();
+        }
+        spans.push(Span::raw(line_text[last..].to_owned()));
+
+        out.push(Line::from(spans));
+    }
+
+    fn search_at_depth(&self, path: &Path, re: &Regex, content_search: bool, out: &mut Vec<Line<'static>>, depth: usize, max_depth: usize) -> Result<(), AppError> {
         if depth > max_depth { return Ok(()); }
 
         for e in self.fs_ops.read_dir(path)? {
@@ -414,36 +437,27 @@ impl App {
             let full = self.fs_ops.path_to_string(&e.path);
 
             if e.is_dir {
-                if !content && re.is_match(&name) {
-                    out.push(Line::from(vec![Span::styled(format!("{full}/"), Style::default().fg(Color::Cyan))]));
+                // Always check name for directories
+                if re.is_match(&name) {
+                    self.add_name_match(out, &full, true);
                 }
                 if depth < max_depth {
-                    self.search_at_depth(&e.path, re, content, out, depth + 1, max_depth)?;
+                    self.search_at_depth(&e.path, re, content_search, out, depth + 1, max_depth)?;
                 }
             } else {
-                if !content && re.is_match(&name) {
-                    out.push(Line::from(full.clone()));
+                // File: check name if not in content-only mode
+                if !content_search && re.is_match(&name) {
+                    self.add_name_match(out, &full, false);
                 }
-                if content {
+
+                // Content search: only if enabled
+                if content_search {
                     if let Ok(head) = self.fs_ops.read_file_head(&e.path) {
                         if infer::get(&head).map_or(true, |k| k.mime_type().starts_with("text")) {
-                            let file_lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
-                            for (i, line_str) in file_lines.iter().enumerate() {
-                                if re.is_match(line_str) {
-                                    // Allocate owned strings to satisfy 'static
-                                    let full_owned = full.clone();
-                                    let line_owned = line_str.clone();
-                                    let prefix = format!("{}:{:4}: ", full_owned, i + 1);
-
-                                    let mut spans = vec![Span::raw(prefix)];
-                                    let mut last = 0;
-                                    for m in re.find_iter(&line_owned) {
-                                        spans.push(Span::raw(line_owned[last..m.start()].to_owned()));
-                                        spans.push(Span::styled(line_owned[m.range()].to_owned(), Style::default().fg(Color::Red)));
-                                        last = m.end();
-                                    }
-                                    spans.push(Span::raw(line_owned[last..].to_owned()));
-                                    out.push(Line::from(spans));
+                            let lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
+                            for (i, line) in lines.iter().enumerate() {
+                                if re.is_match(line) {
+                                    self.add_content_match(out, &full, i, line, re);
                                 }
                             }
                         }
@@ -463,9 +477,10 @@ impl App {
 
         let re = Regex::new(&self.search_query)?;
         let config = self.search_config.expect("search config missing");
+        let content_search = config.kind == SearchKind::Content;
         let mut results = vec![];
 
-        match self.search_at_depth(&self.current_path, &re, config.kind == SearchKind::Content, &mut results, 0, config.max_depth) {
+        match self.search_at_depth(&self.current_path, &re, content_search, &mut results, 0, config.max_depth) {
             Ok(()) => {
                 self.search_results = results;
                 self.search_list_state.select(if self.search_results.is_empty() { None } else { Some(0) });
@@ -506,7 +521,7 @@ impl App {
         };
 
         let text = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-        let path_str = if text.contains(':') {
+        let path_str = if text.contains(':') && text.chars().nth(text.find(':').unwrap() + 1) == Some(' ') {
             text.split(':').next().unwrap_or(text)
         } else {
             text.trim_end_matches('/')
@@ -617,7 +632,7 @@ fn main() -> Result<(), AppError> {
                 "↑↓ jk: select | Enter: go to | Esc: clear | q: quit".into()
             } else {
                 app.status_message.clone().unwrap_or_else(|| {
-                    "q:quit | h l ←→:nav | 0-9:depth name search | /:unlimited name | n:name | c:content".into()
+                    "q:quit | h l ←→:nav | 0-9:depth name | /:unlimited name | n:name | c:content".into()
                 })
             };
 
