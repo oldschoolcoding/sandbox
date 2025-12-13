@@ -1,4 +1,5 @@
-use crossterm::{
+ use std::os::unix::fs::PermissionsExt;
+ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -7,22 +8,23 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
-use ssh2::{Session, Sftp, FileStat};
+use ssh2::{Session, Sftp};
 use std::{
     any::Any,
     env,
     fs::{self, File},
-    io::{self, stdout, BufReader, BufRead, Read},
+    io::{self, stdout, BufRead, Read},
     net::TcpStream,
-    path::{Path, PathBuf, StripPrefixError},
-    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
 use chrono::prelude::*;
 use infer;
 use users::{get_user_by_uid, get_group_by_gid};
 use regex::Regex;
-use zip::{ZipWriter, write::FileOptions};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt; // ← This was missing!
 
 const CHUNK_SIZE: usize = 500;
 
@@ -34,10 +36,6 @@ enum AppError {
     Ssh(#[from] ssh2::Error),
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
-    #[error("Zip error: {0}")]
-    Zip(#[from] zip::result::ZipError),
-    #[error("Path error: {0}")]
-    StripPrefix(#[from] StripPrefixError),
     #[error("Navigation: {0}")]
     Navigation(String),
 }
@@ -69,9 +67,6 @@ trait FileSystemOperations: Any {
 }
 
 struct LocalFileSystem;
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 
 fn format_permissions(metadata: &std::fs::Metadata) -> String {
     #[cfg(unix)]
@@ -125,7 +120,7 @@ impl FileSystemOperations for LocalFileSystem {
 
     fn read_file_chunk(&self, p: &Path, start: usize, count: usize) -> Result<Vec<String>, AppError> {
         let file = File::open(p)?;
-        let reader = BufReader::new(file);
+        let reader = std::io::BufReader::new(file);
         let mut lines = Vec::with_capacity(count);
         for (i, line) in reader.lines().enumerate() {
             if i < start { continue; }
@@ -154,7 +149,7 @@ impl FileSystemOperations for LocalFileSystem {
         };
         let modified = m.modified()
             .ok()
-            .and_then(|t| Some(DateTime::<Local>::from(t)))
+            .map(|t| DateTime::<Local>::from(t)) // ← Fixed: removed unnecessary and_then
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or("N/A".into());
 
@@ -193,7 +188,7 @@ impl SftpFileSystem {
     }
 }
 
-fn format_permissions_sftp(stat: &FileStat) -> String {
+fn format_permissions_sftp(stat: &ssh2::FileStat) -> String {
     let mode = stat.perm.unwrap_or(0);
     let t = if stat.is_dir() { 'd' } else { '-' };
     let r = |mask| if mode & mask != 0 { 'r' } else { '-' };
@@ -237,7 +232,7 @@ impl FileSystemOperations for SftpFileSystem {
 
     fn read_file_chunk(&self, p: &Path, start: usize, count: usize) -> Result<Vec<String>, AppError> {
         let f = self.sftp.open(p)?;
-        let reader = BufReader::new(f);
+        let reader = std::io::BufReader::new(f);
         let mut lines = Vec::with_capacity(count);
         for (i, line) in reader.lines().enumerate() {
             if i < start { continue; }
@@ -265,25 +260,31 @@ impl FileSystemOperations for SftpFileSystem {
     fn as_any(&self) -> &dyn Any { self }
 }
 
-#[derive(PartialEq)]
-enum InputMode { Normal, Search }
+#[derive(PartialEq, Clone, Copy)]
+enum SearchKind { Name, Content }
+
+#[derive(Clone, Copy)]
+struct SearchConfig {
+    kind: SearchKind,
+    max_depth: usize,
+}
 
 #[derive(PartialEq)]
-enum SearchType { Name, Content }
+enum InputMode { Normal, Search }
 
 struct App {
     fs_ops: Box<dyn FileSystemOperations>,
     current_path: PathBuf,
     entries: Vec<FileEntry>,
     list_state: ListState,
+    search_list_state: ListState,
     status_message: Option<String>,
     selected_properties: Option<FileProperties>,
     file_content: Vec<String>,
-    content_cursor: usize,
     input_mode: InputMode,
     search_query: String,
     search_results: Vec<Line<'static>>,
-    search_type: Option<SearchType>,
+    search_config: Option<SearchConfig>,
 }
 
 impl App {
@@ -293,14 +294,14 @@ impl App {
             current_path: PathBuf::new(),
             entries: vec![],
             list_state: ListState::default(),
+            search_list_state: ListState::default(),
             status_message: None,
             selected_properties: None,
             file_content: vec![],
-            content_cursor: 0,
             input_mode: InputMode::Normal,
             search_query: String::new(),
             search_results: vec![],
-            search_type: None,
+            search_config: None,
         };
         app.current_path = app.fs_ops.get_start_path()?;
         app.refresh_entries()?;
@@ -317,10 +318,9 @@ impl App {
     fn refresh_entries(&mut self) -> Result<(), AppError> {
         self.entries = self.fs_ops.read_dir(&self.current_path)?;
         self.entries.sort_by(|a, b| {
-            a.is_dir.cmp(&b.is_dir).reverse().then_with(|| {
-                a.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase()
-                    .cmp(&b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
-            })
+            a.is_dir.cmp(&b.is_dir).reverse().then_with(|| a.path.file_name().unwrap_or_default()
+                .to_string_lossy().to_lowercase()
+                .cmp(&b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase()))
         });
         if self.entries.is_empty() {
             self.list_state.select(None);
@@ -368,89 +368,58 @@ impl App {
             if self.entries[i].is_dir {
                 self.current_path = self.entries[i].path.clone();
                 self.refresh_entries()?;
+                self.clear_search();
             }
         }
         Ok(())
     }
 
     fn leave_dir(&mut self) -> Result<(), AppError> {
-        if self.current_path.parent().is_some() {
-            self.current_path.pop();
+        if self.current_path.pop() {
             self.refresh_entries()?;
+            self.clear_search();
         }
         Ok(())
     }
 
-    fn download_zip(&mut self) -> Result<(), AppError> {
-        let i = match self.list_state.selected() {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        let entry = &self.entries[i];
-        let name = entry.path.file_name().unwrap().to_string_lossy();
-        let ts = Local::now().format("%Y%m%d_%H%M%S");
-        let zip_name = format!("{}_{}_{}.zip", self.get_server_name(), ts, name);
-        let zip_path = PathBuf::from("/tmp").join(zip_name);
-
-        let file = File::create(&zip_path)?;
-        let mut zip = ZipWriter::new(file);
-
-        if entry.is_dir {
-            let base = entry.path.parent().unwrap_or(Path::new("/"));
-            self.recursive_zip(&entry.path, base, &mut zip)?;
-        } else {
-            zip.start_file::<String, ()>(name.to_string(), FileOptions::default())?;
-            io::copy(&mut self.fs_ops.open_file(&entry.path)?, &mut zip)?;
-        }
-        zip.finish()?;
-        self.status_message = Some(format!("ZIP saved: {}", zip_path.display()));
-        Ok(())
+    fn clear_search(&mut self) {
+        self.search_results.clear();
+        self.search_list_state.select(None);
     }
 
-    fn recursive_zip(&self, path: &Path, base: &Path, zip: &mut ZipWriter<File>) -> Result<(), AppError> {
-        for e in self.fs_ops.read_dir(path)? {
-            let rel = e.path.strip_prefix(base)?;
-            let name = rel.to_str().ok_or(AppError::Navigation("non-utf8 path".into()))?;
-            if e.is_dir {
-                self.recursive_zip(&e.path, base, zip)?;
-            } else {
-                zip.start_file::<&str, ()>(name, FileOptions::default())?;
-                io::copy(&mut self.fs_ops.open_file(&e.path)?, zip)?;
+    fn start_search(&mut self, kind: SearchKind, max_depth: usize) {
+        self.input_mode = InputMode::Search;
+        self.search_config = Some(SearchConfig { kind, max_depth });
+        self.search_query.clear();
+        self.clear_search();
+    }
+
+    fn check_interrupt(&self) -> Result<(), AppError> {
+        if event::poll(std::time::Duration::from_millis(0))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press && k.code == KeyCode::Esc {
+                    return Err(AppError::Navigation("Search interrupted".into()));
+                }
             }
         }
         Ok(())
     }
 
-    fn start_search(&mut self, kind: SearchType) {
-        self.input_mode = InputMode::Search;
-        self.search_type = Some(kind);
-        self.search_query.clear();
-        self.search_results.clear();
-    }
+    fn search_at_depth(&self, path: &Path, re: &Regex, content: bool, out: &mut Vec<Line<'static>>, depth: usize, max_depth: usize) -> Result<(), AppError> {
+        if depth > max_depth { return Ok(()); }
 
-    fn perform_search(&mut self) -> Result<(), AppError> {
-        if self.search_query.is_empty() {
-            self.search_results.clear();
-            return Ok(());
-        }
-        let re = Regex::new(&self.search_query)?;
-        let mut results = vec![];
-        let content = self.search_type == Some(SearchType::Content);
-        self.search_recursive(&self.current_path, &re, content, &mut results)?;
-        self.search_results = results;
-        self.input_mode = InputMode::Normal;
-        Ok(())
-    }
-
-    fn search_recursive(&self, path: &Path, re: &Regex, content: bool, out: &mut Vec<Line<'static>>) -> Result<(), AppError> {
         for e in self.fs_ops.read_dir(path)? {
+            self.check_interrupt()?;
             let name = e.path.file_name().unwrap().to_string_lossy();
             let full = self.fs_ops.path_to_string(&e.path);
+
             if e.is_dir {
                 if !content && re.is_match(&name) {
                     out.push(Line::from(vec![Span::styled(format!("{full}/"), Style::default().fg(Color::Cyan))]));
                 }
-                self.search_recursive(&e.path, re, content, out)?;
+                if depth < max_depth {
+                    self.search_at_depth(&e.path, re, content, out, depth + 1, max_depth)?;
+                }
             } else {
                 if !content && re.is_match(&name) {
                     out.push(Line::from(full.clone()));
@@ -458,23 +427,100 @@ impl App {
                 if content {
                     if let Ok(head) = self.fs_ops.read_file_head(&e.path) {
                         if infer::get(&head).map_or(true, |k| k.mime_type().starts_with("text")) {
-                            let lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
-                            for (i, line) in lines.iter().enumerate() {
-                                if re.is_match(line) {
-                                    let mut spans = vec![Span::raw(format!("{}:{:4}: ", full, i + 1))];
+                            let file_lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
+                            for (i, line_str) in file_lines.iter().enumerate() {
+                                if re.is_match(line_str) {
+                                    // Allocate owned strings to satisfy 'static
+                                    let full_owned = full.clone();
+                                    let line_owned = line_str.clone();
+                                    let prefix = format!("{}:{:4}: ", full_owned, i + 1);
+
+                                    let mut spans = vec![Span::raw(prefix)];
                                     let mut last = 0;
-                                    for m in re.find_iter(line) {
-                                        spans.push(Span::raw(line[last..m.start()].to_string()));
-                                        spans.push(Span::styled(line[m.range()].to_string(), Style::default().fg(Color::Red)));
+                                    for m in re.find_iter(&line_owned) {
+                                        spans.push(Span::raw(line_owned[last..m.start()].to_owned()));
+                                        spans.push(Span::styled(line_owned[m.range()].to_owned(), Style::default().fg(Color::Red)));
                                         last = m.end();
                                     }
-                                    spans.push(Span::raw(line[last..].to_string()));
+                                    spans.push(Span::raw(line_owned[last..].to_owned()));
                                     out.push(Line::from(spans));
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn perform_search(&mut self) -> Result<(), AppError> {
+        if self.search_query.is_empty() {
+            self.clear_search();
+            self.input_mode = InputMode::Normal;
+            return Ok(());
+        }
+
+        let re = Regex::new(&self.search_query)?;
+        let config = self.search_config.expect("search config missing");
+        let mut results = vec![];
+
+        match self.search_at_depth(&self.current_path, &re, config.kind == SearchKind::Content, &mut results, 0, config.max_depth) {
+            Ok(()) => {
+                self.search_results = results;
+                self.search_list_state.select(if self.search_results.is_empty() { None } else { Some(0) });
+                self.input_mode = InputMode::Normal;
+                Ok(())
+            }
+            Err(e) => {
+                if let AppError::Navigation(ref msg) = e {
+                    if msg == "Search interrupted" {
+                        self.status_message = Some("Search interrupted".into());
+                        self.input_mode = InputMode::Normal;
+                        return Ok(());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn navigate_search(&mut self, down: bool) {
+        if self.search_results.is_empty() { return; }
+        let len = self.search_results.len();
+        let i = match self.search_list_state.selected() {
+            Some(i) => if down { (i + 1) % len } else { if i == 0 { len - 1 } else { i - 1 } },
+            None => if down { 0 } else { len - 1 },
+        };
+        self.search_list_state.select(Some(i));
+    }
+
+    fn jump_to_selected_result(&mut self) -> Result<(), AppError> {
+        let idx = match self.search_list_state.selected() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let line = match self.search_results.get(idx) {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+
+        let text = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+        let path_str = if text.contains(':') {
+            text.split(':').next().unwrap_or(text)
+        } else {
+            text.trim_end_matches('/')
+        };
+        let target_path = PathBuf::from(path_str);
+
+        if let Some(parent) = target_path.parent() {
+            if parent != self.current_path {
+                self.current_path = parent.to_owned();
+                self.refresh_entries()?;
+            }
+            if let Some(pos) = self.entries.iter().position(|e| e.path == target_path) {
+                self.list_state.select(Some(pos));
+                self.update_selection();
             }
         }
         Ok(())
@@ -504,7 +550,7 @@ fn main() -> Result<(), AppError> {
 
             let main = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Ratio(1,2), Constraint::Ratio(1,2)])
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
                 .split(layout[1]);
 
             f.render_widget(
@@ -524,42 +570,55 @@ fn main() -> Result<(), AppError> {
 
             f.render_stateful_widget(list, main[0], &mut app.list_state);
 
-            let content_lines = if !app.search_results.is_empty() {
-                app.search_results.clone()
-            } else if let Some(p) = &app.selected_properties {
-                let name = app.entries.get(app.list_state.selected().unwrap_or(0))
-                    .and_then(|e| e.path.file_name())
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or("?".into());
-                let mut v = vec![
-                    Line::from(vec![Span::styled(format!("--- {} ---", name), Style::default().bold())]),
-                    Line::from(format!("Perm : {}", p.type_and_permissions)),
-                    Line::from(format!("Size : {} bytes", p.size)),
-                    Line::from(format!("Mod  : {}", p.modified)),
-                ];
-                v.extend(app.file_content.iter().map(|l| Line::from(l.clone())));
-                v
-            } else {
-                vec![Line::from("Select a file or folder")]
-            };
+            if !app.search_results.is_empty() {
+                let result_items: Vec<ListItem> = app.search_results.iter()
+                    .map(|line| ListItem::new(line.clone()))
+                    .collect();
 
-            let title = if !app.search_results.is_empty() {
-                format!("Search results for \"{}\"", app.search_query)
-            } else {
-                "Info".into()
-            };
+                let result_list = List::new(result_items)
+                    .block(Block::default().borders(Borders::ALL)
+                        .title(format!("Results: {} matches", app.search_results.len())))
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
 
-            f.render_widget(
-                Paragraph::new(Text::from(content_lines))
-                    .block(Block::default().borders(Borders::ALL).title(title)),
-                main[1],
-            );
+                f.render_stateful_widget(result_list, main[1], &mut app.search_list_state);
+            } else {
+                let content_lines = if let Some(p) = &app.selected_properties {
+                    let name = app.entries.get(app.list_state.selected().unwrap_or(0))
+                        .and_then(|e| e.path.file_name())
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or("?".into());
+                    let mut v = vec![
+                        Line::from(vec![Span::styled(format!("--- {} ---", name), Style::default().bold())]),
+                        Line::from(format!("Perm : {}", p.type_and_permissions)),
+                        Line::from(format!("Size : {} bytes", p.size)),
+                        Line::from(format!("Mod  : {}", p.modified)),
+                    ];
+                    v.extend(app.file_content.iter().map(|l| Line::from(l.clone())));
+                    v
+                } else {
+                    vec![Line::from("Select a file or directory")]
+                };
+
+                f.render_widget(
+                    Paragraph::new(Text::from(content_lines))
+                        .block(Block::default().borders(Borders::ALL).title(" Info ")),
+                    main[1],
+                );
+            }
 
             let status = if app.input_mode == InputMode::Search {
-                let kind = if app.search_type == Some(SearchType::Content) { "content" } else { "name" };
-                format!("Search ({}) {}:", kind, app.search_query)
+                let cfg = app.search_config.unwrap();
+                let kind = if cfg.kind == SearchKind::Content { "content" } else { "name" };
+                let depth = if cfg.max_depth == 0 { "current only" }
+                           else if cfg.max_depth == usize::MAX { "unlimited" }
+                           else { &format!("depth {}", cfg.max_depth) };
+                format!("Search ({kind}, {depth}): {}", app.search_query)
+            } else if !app.search_results.is_empty() {
+                "↑↓ jk: select | Enter: go to | Esc: clear | q: quit".into()
             } else {
-                app.status_message.clone().unwrap_or_else(|| "q=quit | d=download ZIP | f=search name | c=search content".into())
+                app.status_message.clone().unwrap_or_else(|| {
+                    "q:quit | h l ←→:nav | 0-9:depth name search | /:unlimited name | n:name | c:content".into()
+                })
             };
 
             f.render_widget(Paragraph::new(status), layout[2]);
@@ -567,31 +626,53 @@ fn main() -> Result<(), AppError> {
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match app.input_mode {
-                        InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('d') => { let _ = app.download_zip(); }
-                            KeyCode::Char('f') => app.start_search(SearchType::Name),
-                            KeyCode::Char('c') => app.start_search(SearchType::Content),
-                            KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                            KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                            KeyCode::Left | KeyCode::Char('h') => { let _ = app.leave_dir(); }
-                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => { let _ = app.enter_dir(); }
-                            _ => {}
-                        },
-                        InputMode::Search => match key.code {
-                            KeyCode::Char(c) => app.search_query.push(c),
-                            KeyCode::Backspace => { app.search_query.pop(); }
-                            KeyCode::Enter => { let _ = app.perform_search(); }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                                app.search_query.clear();
-                                app.search_results.clear();
-                            }
-                            _ => {}
+                if key.kind != KeyEventKind::Press { continue; }
+
+                match app.input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('h') | KeyCode::Left => { let _ = app.leave_dir(); }
+                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => { let _ = app.enter_dir(); }
+
+                        KeyCode::Char('0') => app.start_search(SearchKind::Name, 0),
+                        KeyCode::Char(d @ '1'..='9') => {
+                            let depth = d.to_digit(10).unwrap() as usize;
+                            app.start_search(SearchKind::Name, depth);
                         }
-                    }
+                        KeyCode::Char('/') => app.start_search(SearchKind::Name, usize::MAX),
+                        KeyCode::Char('n') => app.start_search(SearchKind::Name, usize::MAX),
+                        KeyCode::Char('c') => app.start_search(SearchKind::Content, usize::MAX),
+
+                        _ => {
+                            if !app.search_results.is_empty() {
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => app.navigate_search(false),
+                                    KeyCode::Down | KeyCode::Char('j') => app.navigate_search(true),
+                                    KeyCode::Enter => { let _ = app.jump_to_selected_result(); }
+                                    KeyCode::Esc => app.clear_search(),
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+                                    KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    },
+
+                    InputMode::Search => match key.code {
+                        KeyCode::Char(c) => app.search_query.push(c),
+                        KeyCode::Backspace => { app.search_query.pop(); }
+                        KeyCode::Enter => { let _ = app.perform_search(); }
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                            app.search_query.clear();
+                            app.clear_search();
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
