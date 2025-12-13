@@ -1,16 +1,18 @@
 [package]
 name = "flyer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-chrono = "0.4.42"
-crossterm = "0.29.0"
-infer = "0.19.0"
-ratatui = "0.29.0"
-regex = "1.12.2"
-ssh2 = "0.9.5"
-thiserror = "2.0.17"
-users = "0.11.0"
-write = "0.1.0"
-zip = "6.0.0"
+crossterm = "0.27"
+ratatui = "0.26"
+ssh2 = "0.9"
+thiserror = "1.0"
+chrono = "0.4"
+infer = "0.15"
+users = "0.11"
+regex = "1.10"
+aes-gcm = "0.10"
+argon2 = { version = "0.5", features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
