@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Cell, Table, TableState},
 };
 use ssh2::{Session, Sftp};
 use std::{
@@ -92,10 +92,18 @@ fn format_permissions(metadata: &std::fs::Metadata) -> String {
 
 impl FileSystemOperations for LocalFileSystem {
     fn read_dir(&self, p: &Path) -> Result<Vec<FileEntry>, AppError> {
-        Ok(fs::read_dir(p)?
+        let mut entries: Vec<_> = fs::read_dir(p)?
             .filter_map(Result::ok)
             .map(|e| FileEntry { path: e.path(), is_dir: e.path().is_dir() })
-            .collect())
+            .collect();
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                a.path.file_name().unwrap_or_default()
+                    .to_string_lossy().to_lowercase()
+                    .cmp(&b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+            })
+        });
+        Ok(entries)
     }
 
     fn get_start_path(&self) -> Result<PathBuf, AppError> {
@@ -204,10 +212,18 @@ fn format_permissions_sftp(stat: &ssh2::FileStat) -> String {
 
 impl FileSystemOperations for SftpFileSystem {
     fn read_dir(&self, p: &Path) -> Result<Vec<FileEntry>, AppError> {
-        Ok(self.sftp.readdir(p)?
+        let mut entries: Vec<_> = self.sftp.readdir(p)?
             .into_iter()
             .map(|(p, s)| FileEntry { path: p, is_dir: s.is_dir() })
-            .collect())
+            .collect();
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                a.path.file_name().unwrap_or_default()
+                    .to_string_lossy().to_lowercase()
+                    .cmp(&b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+            })
+        });
+        Ok(entries)
     }
 
     fn get_start_path(&self) -> Result<PathBuf, AppError> {
@@ -276,10 +292,9 @@ struct App {
     fs_ops: Box<dyn FileSystemOperations>,
     current_path: PathBuf,
     entries: Vec<FileEntry>,
-    list_state: ListState,
+    table_state: TableState,
     search_list_state: ListState,
     status_message: Option<String>,
-    selected_properties: Option<FileProperties>,
     file_content: Vec<String>,
     input_mode: InputMode,
     search_query: String,
@@ -293,10 +308,9 @@ impl App {
             fs_ops: fs,
             current_path: PathBuf::new(),
             entries: vec![],
-            list_state: ListState::default(),
+            table_state: TableState::default(),
             search_list_state: ListState::default(),
             status_message: None,
-            selected_properties: None,
             file_content: vec![],
             input_mode: InputMode::Normal,
             search_query: String::new(),
@@ -310,27 +324,20 @@ impl App {
 
     fn refresh_entries(&mut self) -> Result<(), AppError> {
         self.entries = self.fs_ops.read_dir(&self.current_path)?;
-        self.entries.sort_by(|a, b| {
-            a.is_dir.cmp(&b.is_dir).reverse().then_with(|| a.path.file_name().unwrap_or_default()
-                .to_string_lossy().to_lowercase()
-                .cmp(&b.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase()))
-        });
         if self.entries.is_empty() {
-            self.list_state.select(None);
+            self.table_state.select(None);
         } else {
-            let i = self.list_state.selected().unwrap_or(0).min(self.entries.len() - 1);
-            self.list_state.select(Some(i));
+            let i = self.table_state.selected().unwrap_or(0).min(self.entries.len() - 1);
+            self.table_state.select(Some(i));
         }
         self.update_selection();
         Ok(())
     }
 
     fn update_selection(&mut self) {
-        self.selected_properties = None;
         self.file_content.clear();
-        if let Some(i) = self.list_state.selected() {
+        if let Some(i) = self.table_state.selected() {
             if let Some(e) = self.entries.get(i) {
-                self.selected_properties = self.fs_ops.get_file_properties(&e.path).ok();
                 if !e.is_dir {
                     self.file_content = self.fs_ops.read_file_chunk(&e.path, 0, CHUNK_SIZE).unwrap_or_default();
                 }
@@ -339,25 +346,25 @@ impl App {
     }
 
     fn select_prev(&mut self) {
-        let i = match self.list_state.selected() {
+        let i = match self.table_state.selected() {
             Some(i) => if i == 0 { self.entries.len().saturating_sub(1) } else { i - 1 },
             None => 0,
         };
-        self.list_state.select(Some(i));
+        self.table_state.select(Some(i));
         self.update_selection();
     }
 
     fn select_next(&mut self) {
-        let i = match self.list_state.selected() {
+        let i = match self.table_state.selected() {
             Some(i) => if i + 1 >= self.entries.len() { 0 } else { i + 1 },
             None => 0,
         };
-        self.list_state.select(Some(i));
+        self.table_state.select(Some(i));
         self.update_selection();
     }
 
     fn enter_dir(&mut self) -> Result<(), AppError> {
-        if let Some(i) = self.list_state.selected() {
+        if let Some(i) = self.table_state.selected() {
             if self.entries[i].is_dir {
                 self.current_path = self.entries[i].path.clone();
                 self.refresh_entries()?;
@@ -398,7 +405,6 @@ impl App {
         Ok(())
     }
 
-    // Unified result creation: both name and content matches use same format
     fn add_name_match(&self, out: &mut Vec<Line<'static>>, full: &str, is_dir: bool) {
         let path_display = if is_dir {
             format!("{full}/")
@@ -420,7 +426,7 @@ impl App {
         let mut last = 0;
         for m in re.find_iter(line_text) {
             spans.push(Span::raw(line_text[last..m.start()].to_owned()));
-            spans.push(Span::styled(line_text[m.range()].to_owned(), Style::default().fg(Color::Red)));
+            spans.push(Span::styled(line_text[m.range()].to_owned(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
             last = m.end();
         }
         spans.push(Span::raw(line_text[last..].to_owned()));
@@ -437,7 +443,6 @@ impl App {
             let full = self.fs_ops.path_to_string(&e.path);
 
             if e.is_dir {
-                // Always check name for directories
                 if re.is_match(&name) {
                     self.add_name_match(out, &full, true);
                 }
@@ -445,15 +450,14 @@ impl App {
                     self.search_at_depth(&e.path, re, content_search, out, depth + 1, max_depth)?;
                 }
             } else {
-                // File: check name if not in content-only mode
                 if !content_search && re.is_match(&name) {
                     self.add_name_match(out, &full, false);
                 }
 
-                // Content search: only if enabled
                 if content_search {
                     if let Ok(head) = self.fs_ops.read_file_head(&e.path) {
-                        if infer::get(&head).map_or(true, |k| k.mime_type().starts_with("text")) {
+                        // Fixed: use mime_type() and check if it starts with "text/"
+                        if infer::get(&head).map_or(true, |k| k.mime_type().starts_with("text/")) {
                             let lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
                             for (i, line) in lines.iter().enumerate() {
                                 if re.is_match(line) {
@@ -475,7 +479,7 @@ impl App {
             return Ok(());
         }
 
-        let re = Regex::new(&self.search_query)?;
+        let re = Regex::new(&format!("(?i){}", self.search_query))?; // Case-insensitive
         let config = self.search_config.expect("search config missing");
         let content_search = config.kind == SearchKind::Content;
         let mut results = vec![];
@@ -520,9 +524,9 @@ impl App {
             None => return Ok(()),
         };
 
-        let text = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-        let path_str = if text.contains(':') && text.chars().nth(text.find(':').unwrap() + 1) == Some(' ') {
-            text.split(':').next().unwrap_or(text)
+        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let path_str = if text.contains(": ") {
+            text.split(": ").next().unwrap_or(&text)
         } else {
             text.trim_end_matches('/')
         };
@@ -534,7 +538,7 @@ impl App {
                 self.refresh_entries()?;
             }
             if let Some(pos) = self.entries.iter().position(|e| e.path == target_path) {
-                self.list_state.select(Some(pos));
+                self.table_state.select(Some(pos));
                 self.update_selection();
             }
         }
@@ -560,30 +564,98 @@ fn main() -> Result<(), AppError> {
         terminal.draw(|f| {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+                .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
                 .split(f.area());
 
             let main = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .split(layout[1]);
 
             f.render_widget(
                 Paragraph::new(app.fs_ops.path_to_string(&app.current_path))
-                    .block(Block::default().borders(Borders::ALL).title(" Path ")),
+                    .block(Block::default().borders(Borders::ALL).title(" Directory ")),
                 layout[0],
             );
 
-            let items: Vec<ListItem> = app.entries.iter().map(|e| {
-                let name = e.path.file_name().unwrap().to_string_lossy();
-                ListItem::new(if e.is_dir { format!("({})", name) } else { name.into() })
-            }).collect();
+            let header = ["Permissions", "User", "Group", "Size", "Modified", "Name"]
+                .into_iter()
+                .map(Cell::from)
+                .collect::<Row<'static>>()
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .height(1);
 
-            let list = List::new(items)
+            
+            let rows = app.entries.iter().enumerate().map(|(i, e)| {
+    let name = e.path.file_name().unwrap_or_default().to_string_lossy();
+    let display_name = if e.is_dir { format!("{}/", name) } else { name.to_string() };
+
+    let props = app.fs_ops.get_file_properties(&e.path).ok();
+
+    let perms = props
+        .as_ref()
+        .map(|p| p.type_and_permissions.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let user = props
+        .as_ref()
+        .map(|p| p.user.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let group = props
+        .as_ref()
+        .map(|p| p.group.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let size = props
+        .as_ref()
+        .map(|p| p.size.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mod_time = props
+        .as_ref()
+        .map(|p| p.modified.clone())
+        .unwrap_or_else(|| "-".to_string());
+
+    let name_style = if e.is_dir {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let selected_style = if Some(i) == app.table_state.selected() {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+
+    Row::new(vec![
+        Cell::from(perms),
+        Cell::from(user),
+        Cell::from(group),
+        Cell::from(size),
+        Cell::from(mod_time),
+        Cell::from(Span::styled(display_name, name_style)),
+    ])
+    .style(selected_style)
+});
+
+            let widths = [
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(16),
+                Constraint::Fill(1),
+            ];
+
+            let table = Table::new(rows, widths)
+                .header(header)
                 .block(Block::default().borders(Borders::ALL).title(" Files "))
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED)) // Fixed deprecation
+                .column_spacing(1);
 
-            f.render_stateful_widget(list, main[0], &mut app.list_state);
+            f.render_stateful_widget(table, main[0], &mut app.table_state);
 
             if !app.search_results.is_empty() {
                 let result_items: Vec<ListItem> = app.search_results.iter()
@@ -592,31 +664,30 @@ fn main() -> Result<(), AppError> {
 
                 let result_list = List::new(result_items)
                     .block(Block::default().borders(Borders::ALL)
-                        .title(format!("Results: {} matches", app.search_results.len())))
+                        .title(format!(" Search Results ({} matches) ", app.search_results.len())))
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
 
                 f.render_stateful_widget(result_list, main[1], &mut app.search_list_state);
             } else {
-                let content_lines = if let Some(p) = &app.selected_properties {
-                    let name = app.entries.get(app.list_state.selected().unwrap_or(0))
+                let content_lines = if app.file_content.is_empty() {
+                    vec![Line::from("Select a file to preview or a directory for info")]
+                } else {
+                    let selected_name = app.entries.get(app.table_state.selected().unwrap_or(0))
                         .and_then(|e| e.path.file_name())
                         .map(|n| n.to_string_lossy())
                         .unwrap_or("?".into());
+
                     let mut v = vec![
-                        Line::from(vec![Span::styled(format!("--- {} ---", name), Style::default().bold())]),
-                        Line::from(format!("Perm : {}", p.type_and_permissions)),
-                        Line::from(format!("Size : {} bytes", p.size)),
-                        Line::from(format!("Mod  : {}", p.modified)),
+                        Line::from(vec![Span::styled(format!(" Preview: {} ", selected_name), Style::default().bold().fg(Color::Green))]),
+                        Line::from(""),
                     ];
                     v.extend(app.file_content.iter().map(|l| Line::from(l.clone())));
                     v
-                } else {
-                    vec![Line::from("Select a file or directory")]
                 };
 
                 f.render_widget(
                     Paragraph::new(Text::from(content_lines))
-                        .block(Block::default().borders(Borders::ALL).title(" Info ")),
+                        .block(Block::default().borders(Borders::ALL).title(" Preview ")),
                     main[1],
                 );
             }
@@ -624,19 +695,15 @@ fn main() -> Result<(), AppError> {
             let status = if app.input_mode == InputMode::Search {
                 let cfg = app.search_config.unwrap();
                 let kind = if cfg.kind == SearchKind::Content { "content" } else { "name" };
-                let depth = if cfg.max_depth == 0 { "current only" }
-                           else if cfg.max_depth == usize::MAX { "unlimited" }
-                           else { &format!("depth {}", cfg.max_depth) };
-                format!("Search ({kind}, {depth}): {}", app.search_query)
+                let depth = if cfg.max_depth == usize::MAX { "unlimited" } else { &format!("depth {}", cfg.max_depth) };
+                format!("SEARCH ({} | {}): {}", kind, depth, app.search_query)
             } else if !app.search_results.is_empty() {
-                "↑↓ jk: select | Enter: go to | Esc: clear | q: quit".into()
+                "j/k ↑↓: navigate results | Enter: jump to | Esc: clear results | q: quit".into()
             } else {
-                app.status_message.clone().unwrap_or_else(|| {
-                    "q:quit | h l ←→:nav | 0-9:depth name | /:unlimited name | n:name | c:content".into()
-                })
+                "h: back | l/Enter: enter | j/k ↑↓: select | /: search name unlimited | n: name current | c: content search | q: quit".into()
             };
 
-            f.render_widget(Paragraph::new(status), layout[2]);
+            f.render_widget(Paragraph::new(status).style(Style::default().bg(Color::DarkGray)), layout[2]);
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -646,37 +713,31 @@ fn main() -> Result<(), AppError> {
                 match app.input_mode {
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('h') | KeyCode::Left => { let _ = app.leave_dir(); }
-                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => { let _ = app.enter_dir(); }
+                        KeyCode::Char('h') => { let _ = app.leave_dir(); }
+                        KeyCode::Char('l') | KeyCode::Enter => { let _ = app.enter_dir(); }
 
-                        KeyCode::Char('0') => app.start_search(SearchKind::Name, 0),
-                        KeyCode::Char(d @ '1'..='9') => {
-                            let depth = d.to_digit(10).unwrap() as usize;
-                            app.start_search(SearchKind::Name, depth);
-                        }
                         KeyCode::Char('/') => app.start_search(SearchKind::Name, usize::MAX),
-                        KeyCode::Char('n') => app.start_search(SearchKind::Name, usize::MAX),
+                        KeyCode::Char('n') => app.start_search(SearchKind::Name, 0),
                         KeyCode::Char('c') => app.start_search(SearchKind::Content, usize::MAX),
 
                         _ => {
                             if !app.search_results.is_empty() {
                                 match key.code {
-                                    KeyCode::Up | KeyCode::Char('k') => app.navigate_search(false),
-                                    KeyCode::Down | KeyCode::Char('j') => app.navigate_search(true),
+                                    KeyCode::Char('j') | KeyCode::Down => app.navigate_search(true),
+                                    KeyCode::Char('k') | KeyCode::Up => app.navigate_search(false),
                                     KeyCode::Enter => { let _ = app.jump_to_selected_result(); }
                                     KeyCode::Esc => app.clear_search(),
                                     _ => {}
                                 }
                             } else {
                                 match key.code {
-                                    KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                                    KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                                    KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                                    KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
                                     _ => {}
                                 }
                             }
                         }
                     },
-
                     InputMode::Search => match key.code {
                         KeyCode::Char(c) => app.search_query.push(c),
                         KeyCode::Backspace => { app.search_query.pop(); }
