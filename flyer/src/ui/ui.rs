@@ -233,7 +233,13 @@ pub fn draw_search_results(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::default()
             })
-            .title(format!("Search Results ({}) - Tab: switch pane, Enter: jump to file", app.search_results.len())))
+            .title({
+                if let Some(ref cmd) = app.last_executed_command {
+                    format!("Search Results ({}) - Command: {}...", app.search_results.len(), &cmd[..cmd.len().min(50)])
+                } else {
+                    format!("Search Results ({}) - Tab/Ctrl+arrows: switch pane, Enter: jump to file", app.search_results.len())
+                }
+            }))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     f.render_stateful_widget(list, area, &mut app.search_list_state);

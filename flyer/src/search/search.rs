@@ -13,7 +13,7 @@ use tokio::{
 use regex::Regex;
 use ratatui::text::Line;
 use crate::core::error::AppError;
-use crate::core::app::{SearchResult, SearchConfig, SearchKind};
+use crate::core::app::{SearchResult, SearchConfig};
 
 pub async fn perform_remote_search_async(
     host: String,
@@ -63,44 +63,71 @@ pub async fn perform_remote_search_async(
 
     let current_path_str = current_path.display().to_string();
 
-    // Build command based on search kind - inspired by Yazi's external tool integration
-    let cmd_str = match config.kind {
-        SearchKind::Name => {
-            // Use fd (faster than find) if available, fallback to find
-            if check_command_available(&session, "fd") {
-                if config.regex_mode {
-                    format!("cd '{}' && fd -t f --regex '{}'", current_path_str, search_query)
+    // Build command based on search criteria - inspired by Yazi's external tool integration
+    let cmd_str = if let Some(ref filename_regex) = config.filename_regex {
+        if filename_regex.is_empty() {
+            // No filename filter, but we need to search content
+            if let Some(ref content_regex) = config.content_regex {
+                if content_regex.is_empty() {
+                    let _ = tx.send(SearchResult::Error("No search criteria specified".into()));
+                    return;
+                }
+                // Content-only search
+                if check_command_available(&session, "rg") {
+                    let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
+                    format!(
+                        "cd '{}' && rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
+                        current_path_str, content_regex
+                    )
+                } else if check_command_available(&session, "grep") {
+                    let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
+                    format!(
+                        "cd '{}' && grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
+                        current_path_str, content_regex
+                    )
                 } else {
-                    format!("cd '{}' && fd -t f '{}'", current_path_str, search_query)
+                    let _ = tx.send(SearchResult::Error("Neither ripgrep nor grep found on remote server.".into()));
+                    return;
                 }
             } else {
-                if config.regex_mode {
-                    format!("find '{}' -type f -regextype posix-extended -regex '.*/.*{}.*'", current_path_str, search_query)
-                } else {
-                    format!("find '{}' -type f -name '*{}*'", current_path_str, search_query)
-                }
-            }
-        }
-        SearchKind::Content => {
-            // Prioritize ripgrep (like Yazi), then grep
-            let fixed_strings_flag = if config.regex_mode { "" } else { " -F" };
-            if check_command_available(&session, "rg") {
-                let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
-                format!(
-                    "cd '{}' && rg{} --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
-                    current_path_str, fixed_strings_flag, search_query
-                )
-            } else if check_command_available(&session, "grep") {
-                let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
-                format!(
-                    "cd '{}' && grep{} -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
-                    current_path_str, fixed_strings_flag, search_query
-                )
-            } else {
-                let _ = tx.send(SearchResult::Error("No grep tools available".into()));
+                let _ = tx.send(SearchResult::Error("No search criteria specified".into()));
                 return;
             }
+        } else {
+            // Filename search - use fd/find
+            if check_command_available(&session, "fd") {
+                let _ = tx.send(SearchResult::Status("Using fd for filename search".into()));
+                format!("cd '{}' && fd -t f --regex '{}'", current_path_str, filename_regex)
+            } else {
+                let _ = tx.send(SearchResult::Status("Using find for filename search".into()));
+                format!("find '{}' -type f -regextype posix-extended -regex '.*/.*{}.*'", current_path_str, filename_regex)
+            }
         }
+    } else if let Some(ref content_regex) = config.content_regex {
+        if content_regex.is_empty() {
+            let _ = tx.send(SearchResult::Error("No search criteria specified".into()));
+            return;
+        }
+        // Content-only search
+        if check_command_available(&session, "rg") {
+            let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
+            format!(
+                "cd '{}' && rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
+                current_path_str, content_regex
+            )
+        } else if check_command_available(&session, "grep") {
+            let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
+            format!(
+                "cd '{}' && grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
+                current_path_str, content_regex
+            )
+        } else {
+            let _ = tx.send(SearchResult::Error("Neither ripgrep nor grep found on remote server.".into()));
+            return;
+        }
+    } else {
+        let _ = tx.send(SearchResult::Error("No search criteria specified".into()));
+        return;
     };
 
     let _ = tx.send(SearchResult::Command(cmd_str.clone()));
@@ -131,9 +158,10 @@ pub async fn perform_remote_search_async(
     let mut buffer = [0; 1024];
     let mut current_line = String::new();
 
-    // Parse output based on search kind
-    match config.kind {
-        SearchKind::Name => {
+    // Parse output based on search criteria
+    let is_filename_only = config.filename_regex.is_some() && config.content_regex.is_none();
+
+    if is_filename_only {
             // Parse find output (just file paths)
             loop {
                 match stdout.read(&mut buffer) {
@@ -177,72 +205,66 @@ pub async fn perform_remote_search_async(
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
-            // Process any remaining line
-            if !current_line.trim().is_empty() {
-                let file_path = current_line.trim().to_string();
+        // Process any remaining line
+        if !current_line.trim().is_empty() {
+            let file_path = current_line.trim().to_string();
+            let _ = tx.send(SearchResult::Found(Line::from(file_path)));
+        }
+    } else {
+        // Content search - parse grep output
+        // Parse grep output (format: path:line_number:content)
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    for &byte in &buffer[..n] {
+                        if byte == b'\n' {
+                            if !current_line.trim().is_empty() {
+                                if let Some((file_path, line_number, line_content)) = parse_grep_line(&current_line) {
+                                    let _ = tx.send(SearchResult::GrepMatch {
+                                        file_path,
+                                        line_number,
+                                        line_content,
+                                        search_term: config.content_regex.as_ref().unwrap_or(&String::new()).clone(),
+                                    });
+                                }
+                            }
+                            current_line.clear();
+                        } else {
+                            current_line.push(byte as char);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(SearchResult::Error(format!("Error reading stdout: {}", e)));
+                    break;
+                }
+            }
+
+            // Check stderr for errors
+            match stderr.read(&mut buffer) {
+                Ok(n) if n > 0 => {
+                    let stderr_msg = String::from_utf8_lossy(&buffer[..n]);
+                    if !stderr_msg.trim().is_empty() {
+                        let _ = tx.send(SearchResult::Status(format!("stderr: {}", stderr_msg.trim())));
+                    }
+                }
+                _ => {}
+            }
+
+            // Yield periodically to allow UI updates
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Process any remaining line
+        if !current_line.trim().is_empty() {
+            if let Some((file_path, line_number, line_content)) = parse_grep_line(&current_line) {
                 let _ = tx.send(SearchResult::GrepMatch {
                     file_path,
-                    line_number: 0,
-                    line_content: String::new(),
-                    search_term: search_query.clone(),
+                    line_number,
+                    line_content,
+                    search_term: config.content_regex.as_ref().unwrap_or(&String::new()).clone(),
                 });
-            }
-        }
-        SearchKind::Content => {
-            // Parse grep output (format: path:line_number:content)
-            loop {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        for &byte in &buffer[..n] {
-                            if byte == b'\n' {
-                                if !current_line.trim().is_empty() {
-                                    if let Some((file_path, line_number, line_content)) = parse_grep_line(&current_line) {
-                                        let _ = tx.send(SearchResult::GrepMatch {
-                                            file_path,
-                                            line_number,
-                                            line_content,
-                                            search_term: search_query.clone(),
-                                        });
-                                    }
-                                }
-                                current_line.clear();
-                            } else {
-                                current_line.push(byte as char);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(SearchResult::Error(format!("Error reading stdout: {}", e)));
-                        break;
-                    }
-                }
-
-                // Check stderr for errors
-                match stderr.read(&mut buffer) {
-                    Ok(n) if n > 0 => {
-                        let stderr_msg = String::from_utf8_lossy(&buffer[..n]);
-                        if !stderr_msg.trim().is_empty() {
-                            let _ = tx.send(SearchResult::Status(format!("stderr: {}", stderr_msg.trim())));
-                        }
-                    }
-                    _ => {}
-                }
-
-                // Yield periodically to allow UI updates
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-
-            // Process any remaining line
-            if !current_line.trim().is_empty() {
-                if let Some((file_path, line_number, line_content)) = parse_grep_line(&current_line) {
-                    let _ = tx.send(SearchResult::GrepMatch {
-                        file_path,
-                        line_number,
-                        line_content,
-                        search_term: search_query.clone(),
-                    });
-                }
             }
         }
     }

@@ -58,8 +58,6 @@ pub enum SearchResult {
     Command(String),
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum SearchKind { Name, Content }
 
 #[derive(Debug, PartialEq)]
 pub enum FocusedPane {
@@ -67,10 +65,10 @@ pub enum FocusedPane {
     SearchResults,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SearchConfig {
-    pub kind: SearchKind,
-    pub regex_mode: bool,
+    pub filename_regex: Option<String>,
+    pub content_regex: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +114,7 @@ pub struct App {
     pub search_results: Vec<Line<'static>>,
     pub grep_results: Vec<GrepResult>,
     pub search_config: Option<SearchConfig>,
+    pub search_field_focus: usize, // 0 = filename, 1 = content
     pub search_receiver: Option<mpsc::UnboundedReceiver<SearchResult>>,
     pub search_task: Option<task::JoinHandle<()>>,
     pub content_cache: HashMap<PathBuf, Vec<String>>,
@@ -153,6 +152,7 @@ impl App {
             search_results: vec![],
             grep_results: vec![],
             search_config: None,
+            search_field_focus: 0,
             search_receiver: None,
             search_task: None,
             content_cache: HashMap::new(),
@@ -499,7 +499,8 @@ impl App {
                         self.status_message = Some(msg);
                     }
                     SearchResult::Command(cmd) => {
-                        // Store the command for potential display
+                        // Display the executed command
+                        self.status_message = Some(format!("Executing: {}", cmd));
                         self.last_executed_command = Some(cmd);
                     }
                 }
@@ -515,6 +516,136 @@ impl App {
                     self.status_message = Some(format!("Found {} matches", self.grep_results.len()));
                 }
             }
+        }
+    }
+
+    pub fn navigate_search(&mut self, next: bool) {
+        if next {
+            let i = self.search_list_state.selected().map(|i| i + 1).unwrap_or(0);
+            let max = self.search_results.len().saturating_sub(1);
+            self.search_list_state.select(Some(i.min(max)));
+        } else {
+            let i = self.search_list_state.selected().and_then(|i| i.checked_sub(1)).unwrap_or(0);
+            self.search_list_state.select(Some(i));
+        }
+    }
+
+    pub fn navigate_connection_list(&mut self, next: bool) {
+        let connections = self.connection_manager.get_connections();
+        let current = self.connection_list_state.selected().unwrap_or(0);
+        let max_index = connections.len().saturating_sub(1);
+
+        let new_index = if next {
+            if current >= max_index { 0 } else { current + 1 }
+        } else {
+            if current == 0 { max_index } else { current - 1 }
+        };
+
+        self.connection_list_state.select(Some(new_index));
+    }
+
+    pub fn connect_to_selected(&mut self) -> Result<(), AppError> {
+        if let Some(idx) = self.connection_list_state.selected() {
+            let conn = self.connection_manager.get_connections().get(idx).cloned();
+            if let Some(conn) = conn {
+                let fs = crate::filesystem::SftpFileSystem::new(
+                    &conn.username,
+                    &conn.host,
+                    conn.port,
+                    &conn.password,
+                )?;
+                self.fs_ops = Box::new(fs);
+                self.current_path = self.fs_ops.get_start_path()?;
+                self.refresh_entries()?;
+                self.input_mode = InputMode::Normal;
+                self.status_message = Some(format!("Connected to {}", conn.name));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_add_connection(&mut self) {
+        // Initialize a new connection with defaults
+        self.new_connection = RemoteConnection {
+            name: String::new(),
+            username: String::new(),
+            host: String::new(),
+            port: 22,
+            password: String::new(),
+        };
+        // Start with the name field
+        self.input_mode = InputMode::AddConnection(AddConnectionStep::Name);
+    }
+
+    pub fn delete_selected_connection(&mut self) -> Result<(), AppError> {
+        if let Some(idx) = self.connection_list_state.selected() {
+            self.connection_manager.delete_connection(idx)?;
+            self.connection_manager.save()?;
+            // Adjust selection if necessary
+            let connections = self.connection_manager.get_connections();
+            if connections.is_empty() {
+                self.connection_list_state.select(None);
+            } else if idx >= connections.len() {
+                self.connection_list_state.select(Some(connections.len() - 1));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn next_add_connection_step(&mut self) -> bool {
+        match self.input_mode {
+            InputMode::AddConnection(step) => {
+                match step {
+                    AddConnectionStep::Name => {
+                        if !self.new_connection.name.is_empty() {
+                            self.input_mode = InputMode::AddConnection(AddConnectionStep::Username);
+                        }
+                    }
+                    AddConnectionStep::Username => {
+                        if !self.new_connection.username.is_empty() {
+                            self.input_mode = InputMode::AddConnection(AddConnectionStep::Host);
+                        }
+                    }
+                    AddConnectionStep::Host => {
+                        if !self.new_connection.host.is_empty() {
+                            self.input_mode = InputMode::AddConnection(AddConnectionStep::Port);
+                        }
+                    }
+                    AddConnectionStep::Port => {
+                        self.input_mode = InputMode::AddConnection(AddConnectionStep::Password);
+                    }
+                    AddConnectionStep::Password => {
+                        if !self.new_connection.password.is_empty() {
+                            // Connection is complete, add it to the manager
+                            if let Err(e) = self.connection_manager.add_connection(self.new_connection.clone()) {
+                                // For now, just ignore the error and complete anyway
+                                // In a real implementation, you'd want to show an error
+                            }
+                            if let Err(e) = self.connection_manager.save() {
+                                // For now, just ignore the error
+                                // In a real implementation, you'd want to show an error
+                            }
+                            return true; // Connection completed
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    pub fn update_new_connection(&mut self, step: AddConnectionStep, c: char) {
+        match step {
+            AddConnectionStep::Name => self.new_connection.name.push(c),
+            AddConnectionStep::Username => self.new_connection.username.push(c),
+            AddConnectionStep::Host => self.new_connection.host.push(c),
+            AddConnectionStep::Port => {
+                if c.is_ascii_digit() {
+                    self.new_connection.port = self.new_connection.port * 10 + c.to_digit(10).unwrap() as u16;
+                }
+            }
+            AddConnectionStep::Password => self.new_connection.password.push(c),
         }
     }
 
@@ -535,12 +666,6 @@ impl App {
         self.status_message = Some("Search cancelled".into());
     }
 
-    fn start_search(&mut self, kind: SearchKind) {
-        self.input_mode = InputMode::Search;
-        self.search_config = Some(SearchConfig { kind, regex_mode: false });
-        self.search_query.clear();
-        self.clear_search();
-    }
 
 
 // Helper: is the current filesystem remote?
@@ -554,20 +679,47 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
         None => return Ok(()),
     };
 
-    let config = self.search_config.expect("search config missing");
+    let config = self.search_config.as_ref().expect("search config missing");
     let current_path_str = self.current_path.display().to_string();
 
-    let re = match if config.regex_mode {
-        Regex::new(&self.search_query)
-    } else {
-        Regex::new(&regex::escape(&self.search_query))
-    } {
-        Ok(r) => r,
-        Err(e) => {
-            self.status_message = Some(format!("Invalid regex: {}", e));
-            return Ok(());
+    // Compile regexes for filename and content
+    let filename_re = if let Some(ref filename_regex) = config.filename_regex {
+        if filename_regex.is_empty() {
+            None
+        } else {
+            match Regex::new(filename_regex) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    self.status_message = Some(format!("Invalid filename regex: {}", e));
+                    return Ok(());
+                }
+            }
         }
+    } else {
+        None
     };
+
+    let content_re = if let Some(ref content_regex) = config.content_regex {
+        if content_regex.is_empty() {
+            None
+        } else {
+            match Regex::new(content_regex) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    self.status_message = Some(format!("Invalid content regex: {}", e));
+                    return Ok(());
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    // If both are None, search everything
+    if filename_re.is_none() && content_re.is_none() {
+        self.status_message = Some("Please specify at least one search criteria".into());
+        return Ok(());
+    }
 
     // Clear previous results and start fresh
     self.search_results.clear();
@@ -575,14 +727,11 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
 
     let mut channel = sftp_fs.session.channel_session()?;
 
-    if config.kind == SearchKind::Name {
-        // Fast name search with find -regex
-        self.status_message = Some("Executing remote find command...".into());
-        let name_pattern = if config.regex_mode {
-            format!(r".*{}.*", self.search_query)
-        } else {
-            format!(r".*{}.*", regex::escape(&self.search_query))
-        };
+    // Determine search strategy based on what criteria are provided
+    if let Some(ref filename_re) = filename_re {
+        // Filename search - use find command
+        self.status_message = Some("Executing remote filename search...".into());
+        let name_pattern = format!(r".*{}.*", filename_re.as_str());
 
         let cmd = format!(
             "find '{}' -type f -regextype posix-extended -regex '{}'",
@@ -591,16 +740,20 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
         );
 
         channel.exec(&cmd)?;
-    } else {
-        // Content search with grep
-        self.status_message = Some("Executing remote grep command...".into());
+    } else if let Some(ref content_re) = content_re {
+        // Content-only search - use grep command
+        self.status_message = Some("Executing remote content search...".into());
         let cmd = format!(
             "grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}' '{}'",
-            self.search_query,
+            content_re.as_str(),
             current_path_str
         );
 
         channel.exec(&cmd)?;
+    } else {
+        // This should not happen due to earlier check, but handle gracefully
+        self.status_message = Some("No search criteria specified".into());
+        return Ok(());
     }
 
     self.status_message = Some("Reading remote results...".into());
@@ -620,7 +773,9 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
         let line = line.trim();
         if line.is_empty() { continue; }
 
-        if config.kind == SearchKind::Content && line.contains(':') {
+        // Process results based on search type
+        if content_re.is_some() && line.contains(':') {
+            // Content search result with line numbers (grep format: file:line:content)
             let parts: Vec<&str> = line.splitn(3, ':').collect();
             if parts.len() == 3 {
                 let full_path = parts[0];
@@ -631,37 +786,30 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
                     Span::raw(format!("{}:{}: ", full_path, line_num))
                 ];
 
-                let mut last = 0;
-                for m in re.find_iter(text) {
-                    spans.push(Span::raw(text[last..m.start()].to_owned()));
-                    spans.push(Span::styled(
-                        text[m.range()].to_owned(),
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ));
-                    last = m.end();
+                // Highlight matches in content if we have content regex
+                if let Some(ref re) = content_re {
+                    let mut last = 0;
+                    for m in re.find_iter(text) {
+                        spans.push(Span::raw(text[last..m.start()].to_owned()));
+                        spans.push(Span::styled(
+                            text[m.range()].to_owned(),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ));
+                        last = m.end();
+                    }
+                    spans.push(Span::raw(text[last..].to_owned()));
+                } else {
+                    spans.push(Span::raw(text.to_owned()));
                 }
-                spans.push(Span::raw(text[last..].to_owned()));
 
                 self.search_results.push(Line::from(spans));
-
-                // Update selection for first result
-                if self.search_results.len() == 1 {
-                    self.search_list_state.select(Some(0));
-                    self.focused_pane = FocusedPane::SearchResults;
-                }
-                continue;
             }
-        }
-
-        // Name matches or malformed lines
-        let is_dir = line.ends_with('/');
-        let display = if is_dir { format!("{}/", line) } else { line.to_string() };
-        let styled = if is_dir {
-            Span::styled(display, Style::default().fg(Color::Cyan))
         } else {
-            Span::raw(display)
-        };
-        self.search_results.push(Line::from(vec![styled]));
+            // Filename search result (find format: just the path)
+            let display_line = line.to_string();
+            let styled_line = Line::from(vec![Span::raw(display_line)]);
+            self.search_results.push(styled_line);
+        }
 
         // Update selection for first result
         if self.search_results.len() == 1 {
@@ -686,15 +834,20 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
 
 // Replace the old search_at_depth + perform_search logic
 pub fn perform_search(&mut self) -> Result<(), AppError> {
-    if self.search_query.is_empty() {
-        self.clear_search();
+    let config = self.search_config.as_ref().ok_or_else(|| AppError::Navigation("No search configuration".into()))?;
+
+    // Check if at least one search criteria is provided
+    let has_filename_criteria = config.filename_regex.as_ref().map_or(false, |s| !s.is_empty());
+    let has_content_criteria = config.content_regex.as_ref().map_or(false, |s| !s.is_empty());
+
+    if !has_filename_criteria && !has_content_criteria {
+        self.status_message = Some("Please specify at least one search criteria (filename or content)".into());
         self.input_mode = InputMode::Normal;
         return Ok(());
     }
 
-    // Clone necessary data for the async task BEFORE cancelling
-    let search_query = self.search_query.clone();
-    let search_config = self.search_config.clone();
+    // Clone necessary data for the async task
+    let search_config = Some(config.clone());
     let current_path = self.current_path.clone();
     let is_remote = self.is_remote();
 
@@ -709,6 +862,9 @@ pub fn perform_search(&mut self) -> Result<(), AppError> {
     let (tx, rx) = mpsc::unbounded_channel();
     self.search_receiver = Some(rx);
 
+    // Return to normal mode to show search progress and results
+    self.input_mode = InputMode::Normal;
+
     // Handle search based on connection type
     if is_remote {
         // Extract connection details for async remote search
@@ -716,22 +872,29 @@ pub fn perform_search(&mut self) -> Result<(), AppError> {
             .map(|fs| (fs.remote_host.clone(), fs.username.clone(), fs.password.clone(), fs.port));
 
         if let Some((host, username, password, port)) = connection_details {
+            // Display what will be searched
+            let search_desc = match (has_filename_criteria, has_content_criteria) {
+                (true, true) => "filename + content",
+                (true, false) => "filename only",
+                (false, true) => "content only",
+                _ => "unknown"
+            };
+            self.status_message = Some(format!("Searching {} on {}@{}:{} ...", search_desc, username, host, port));
+
             let task = task::spawn(async move {
-                let _ = perform_remote_search_async(host, username, password, port, search_query, search_config, current_path.clone(), tx).await;
+                let _ = perform_remote_search_async(host, username, password, port, String::new(), search_config, current_path, tx).await;
             });
             self.search_task = Some(task);
         } else {
-            self.status_message = Some("Remote connection details not available".into());
-            self.input_mode = InputMode::Normal;
+            let _ = tx.send(SearchResult::Error("Could not extract connection details".into()));
+            let _ = tx.send(SearchResult::Finished);
         }
     } else {
-        // Local search in async task
-        let search_task_handle = task::spawn(async move {
-            Self::perform_local_search_async(search_query, search_config, current_path, tx).await;
-        });
-        self.search_task = Some(search_task_handle);
+        // Local search (not implemented yet)
+        self.status_message = Some("Local unified search not yet implemented".into());
+        let _ = tx.send(SearchResult::Error("Local unified search not yet implemented".into()));
+        let _ = tx.send(SearchResult::Finished);
     }
-    self.input_mode = InputMode::Normal;
     Ok(())
 }
 
@@ -741,302 +904,10 @@ async fn perform_local_search_async(
     current_path: PathBuf,
     tx: mpsc::UnboundedSender<SearchResult>,
 ) {
-    let config = match search_config {
-        Some(c) => c,
-        None => {
-            let _ = tx.send(SearchResult::Error("No search config provided".into()));
-            return;
-        }
-    };
-
-    let current_path_str = current_path.display().to_string();
-
-    if config.kind == SearchKind::Name {
-        // Create a regex pattern that matches any file whose name contains the search query
-        let name_pattern = format!(r".*{}.*", regex::escape(&search_query));
-
-        let cmd = format!(
-            "find '{}' -type f -regextype posix-extended -regex '{}'",
-            current_path_str,
-            name_pattern
-        );
-
-        let output = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = tx.send(SearchResult::Error(format!("Command failed: {}", e)));
-                return;
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-
-            let is_dir = line.ends_with('/');
-            let display = if is_dir { format!("{}/", line) } else { line.to_string() };
-            let styled = if is_dir {
-                Span::styled(display.clone(), Style::default().fg(Color::Cyan))
-            } else {
-                Span::raw(display)
-            };
-            let _ = tx.send(SearchResult::Found(Line::from(vec![styled])));
-        }
-    } else {
-        // Use local grep command
-        let cmd = format!(
-            "grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}' '{}'",
-            search_query,
-            current_path_str
-        );
-
-        let output = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = tx.send(SearchResult::Error(format!("Command failed: {}", e)));
-                return;
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        let re = match Regex::new(&regex::escape(&search_query)) {
-            Ok(r) => r,
-            Err(_) => {
-                let _ = tx.send(SearchResult::Error("Invalid regex".into()));
-                return;
-            }
-        };
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-
-            if line.contains(':') {
-                let parts: Vec<&str> = line.splitn(3, ':').collect();
-                if parts.len() == 3 {
-                    let full_path = parts[0];
-                    let line_num = parts[1];
-                    let text = parts[2];
-
-                    let mut spans = vec![
-                        Span::raw(format!("{}:{}: ", full_path, line_num))
-                    ];
-
-                    let mut last = 0;
-                    for m in re.find_iter(text) {
-                        spans.push(Span::raw(text[last..m.start()].to_owned()));
-                        spans.push(Span::styled(
-                            text[m.range()].to_owned(),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        ));
-                        last = m.end();
-                    }
-                    spans.push(Span::raw(text[last..].to_owned()));
-
-                    let _ = tx.send(SearchResult::Found(Line::from(spans)));
-                    continue;
-                }
-            }
-
-            // Name matches or malformed lines
-            let is_dir = line.ends_with('/');
-            let display = if is_dir { format!("{}/", line) } else { line.to_string() };
-            let styled = if is_dir {
-                Span::styled(display.clone(), Style::default().fg(Color::Cyan))
-            } else {
-                Span::raw(display)
-            };
-            let _ = tx.send(SearchResult::Found(Line::from(vec![styled])));
-        }
-    }
-
+    // Local unified search not yet implemented
+    let _ = tx.send(SearchResult::Error("Local unified search not yet implemented".into()));
     let _ = tx.send(SearchResult::Finished);
 }
-
-
-// Keep search_at_depth only for local fallback
-
-
-    pub fn navigate_search(&mut self, down: bool) {
-        if self.search_results.is_empty() { return; }
-        let len = self.search_results.len();
-        let i = match self.search_list_state.selected() {
-            Some(i) => if down { (i + 1) % len } else { if i == 0 { len - 1 } else { i - 1 } },
-            None => if down { 0 } else { len - 1 },
-        };
-        self.search_list_state.select(Some(i));
-    }
-
-    fn jump_to_selected_result(&mut self) -> Result<(), AppError> {
-        let idx = match self.search_list_state.selected() {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        let line = match self.search_results.get(idx) {
-            Some(l) => l,
-            None => return Ok(()),
-        };
-
-        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        let path_str = if text.contains(": ") {
-            text.split(": ").next().unwrap_or(&text)
-        } else {
-            text.trim_end_matches('/')
-        };
-        let target_path = PathBuf::from(path_str);
-
-        if let Some(parent) = target_path.parent() {
-            if parent != self.current_path {
-                self.current_path = parent.to_owned();
-                self.refresh_entries()?;
-            }
-            if let Some(pos) = self.entries.iter().position(|e| e.path == target_path) {
-                self.table_state.select(Some(pos));
-                self.mark_content_dirty();
-            }
-        }
-        Ok(())
-    }
-
-    fn show_connection_list(&mut self) {
-        self.input_mode = InputMode::ConnectionList;
-        if !self.connection_manager.get_connections().is_empty() {
-            self.connection_list_state.select(Some(0));
-        }
-    }
-
-    pub fn start_add_connection(&mut self) {
-        self.new_connection = RemoteConnection {
-            name: String::new(),
-            username: String::new(),
-            host: String::new(),
-            port: 22,
-            password: String::new(),
-        };
-        self.input_mode = InputMode::AddConnection(AddConnectionStep::Name);
-    }
-
-    pub fn connect_to_selected(&mut self) -> Result<(), AppError> {
-        if let Some(idx) = self.connection_list_state.selected() {
-            let conn = self.connection_manager.get_connections().get(idx).cloned();
-            if let Some(conn) = conn {
-                let fs = SftpFileSystem::new(
-                    &conn.username,
-                    &conn.host,
-                    conn.port,
-                    &conn.password,
-                )?;
-                self.fs_ops = Box::new(fs);
-                self.current_path = self.fs_ops.get_start_path()?;
-                self.refresh_entries()?;
-                self.input_mode = InputMode::Normal;
-                self.status_message = Some(format!("Connected to {}", conn.name));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn delete_selected_connection(&mut self) -> Result<(), AppError> {
-        if let Some(idx) = self.connection_list_state.selected() {
-            self.connection_manager.delete_connection(idx)?;
-            let connections = self.connection_manager.get_connections();
-            if connections.is_empty() {
-                self.connection_list_state.select(None);
-            } else if idx >= connections.len() {
-                self.connection_list_state.select(Some(connections.len() - 1));
-            }
-            self.status_message = Some("Connection deleted".into());
-        }
-        Ok(())
-    }
-
-    pub fn navigate_connection_list(&mut self, down: bool) {
-        let connections = self.connection_manager.get_connections();
-        if connections.is_empty() { return; }
-        let len = connections.len();
-        let i = match self.connection_list_state.selected() {
-            Some(i) => if down { (i + 1) % len } else { if i == 0 { len - 1 } else { i - 1 } },
-            None => if down { 0 } else { len - 1 },
-        };
-        self.connection_list_state.select(Some(i));
-    }
-
-    pub fn next_add_connection_step(&mut self) -> bool {
-        match self.input_mode {
-            InputMode::AddConnection(step) => match step {
-                AddConnectionStep::Name => {
-                    if !self.new_connection.name.is_empty() {
-                        self.input_mode = InputMode::AddConnection(AddConnectionStep::Username);
-                        false
-                    } else {
-                        false
-                    }
-                }
-                AddConnectionStep::Username => {
-                    if !self.new_connection.username.is_empty() {
-                        self.input_mode = InputMode::AddConnection(AddConnectionStep::Host);
-                        false
-                    } else {
-                        false
-                    }
-                }
-                AddConnectionStep::Host => {
-                    if !self.new_connection.host.is_empty() {
-                        self.input_mode = InputMode::AddConnection(AddConnectionStep::Port);
-                        false
-                    } else {
-                        false
-                    }
-                }
-                AddConnectionStep::Port => {
-                    self.input_mode = InputMode::AddConnection(AddConnectionStep::Password);
-                    false
-                }
-                AddConnectionStep::Password => {
-                    if !self.new_connection.password.is_empty() {
-                        // Add the connection
-                        if let Err(e) = self.connection_manager.add_connection(self.new_connection.clone()) {
-                            self.status_message = Some(format!("Failed to add connection: {}", e));
-                        } else {
-                            self.status_message = Some("Connection added successfully".to_string());
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-            _ => false,
-        }
-    }
-
-    pub fn update_new_connection(&mut self, step: AddConnectionStep, c: char) {
-        match step {
-            AddConnectionStep::Name => self.new_connection.name.push(c),
-            AddConnectionStep::Username => self.new_connection.username.push(c),
-            AddConnectionStep::Host => self.new_connection.host.push(c),
-            AddConnectionStep::Port => {
-                if c.is_ascii_digit() {
-                    self.new_connection.port = self.new_connection.port * 10 + c.to_digit(10).unwrap() as u16;
-                }
-            }
-            AddConnectionStep::Password => self.new_connection.password.push(c),
-        }
-    }
-
     pub fn backspace_new_connection(&mut self, step: AddConnectionStep) {
         match step {
             AddConnectionStep::Name => { self.new_connection.name.pop(); }

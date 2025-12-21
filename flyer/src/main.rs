@@ -67,7 +67,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                             if app.connection_manager.load(&app.password_input).is_ok() {
                                 app.input_mode = InputMode::Normal;
                                 break;
-                            } else {
+        } else {
                                 app.password_input.clear();
                             }
                         }
@@ -102,21 +102,67 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                     ui::draw_add_connection(f, &app, f.size(), step);
                 }
                 InputMode::Search => {
-                    let mode_indicator = if app.search_config.map_or(false, |c| c.regex_mode) { "[REGEX]" } else { "[TEXT]" };
-                    let kind_indicator = match app.search_config.map(|c| c.kind) {
-                        Some(crate::core::app::SearchKind::Name) => "NAME",
-                        Some(crate::core::app::SearchKind::Content) => "CONTENT",
-                        None => "UNKNOWN",
+                    use ratatui::widgets::{Paragraph, Block, Borders};
+                    use ratatui::layout::{Layout, Direction, Constraint, Rect};
+
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3), // Filename regex field
+                            Constraint::Length(3), // Content regex field
+                            Constraint::Min(0),    // Help text
+                        ])
+                        .split(f.size());
+
+                    // Filename regex field
+                    let filename_title = if app.search_field_focus == 0 {
+                        "Filename Regex (focused)"
+                    } else {
+                        "Filename Regex"
                     };
-                    let title = format!("Search ({}{}) - Ctrl+R: toggle regex, F1-F4: patterns", kind_indicator, mode_indicator);
-                    let query_display = format!("{}{}", app.search_query, if app.search_query.is_empty() { "_" } else { "|" });
+                    let filename_value = app.search_config.as_ref()
+                        .and_then(|c| c.filename_regex.as_ref())
+                        .map(|s| if s.is_empty() { "_" } else { s })
+                        .unwrap_or("_");
 
-                    let help_text = "\nF1: word boundary  F2: digits  F3: extension  F4: path separator\nEsc: cancel  Enter: search  Backspace: delete";
-                    let full_display = format!("{}{}", query_display, help_text);
+                    let filename_para = Paragraph::new(filename_value)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .title(filename_title)
+                            .border_style(if app.search_field_focus == 0 {
+                                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
+                            } else {
+                                ratatui::style::Style::default()
+                            }));
+                    f.render_widget(filename_para, chunks[0]);
 
-                    let para = ratatui::widgets::Paragraph::new(full_display)
-                        .block(ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title(title));
-                    f.render_widget(para, f.size());
+                    // Content regex field
+                    let content_title = if app.search_field_focus == 1 {
+                        "Content Regex (focused)"
+        } else {
+                        "Content Regex"
+                    };
+                    let content_value = app.search_config.as_ref()
+                        .and_then(|c| c.content_regex.as_ref())
+                        .map(|s| if s.is_empty() { "_" } else { s })
+                        .unwrap_or("_");
+
+                    let content_para = Paragraph::new(content_value)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .title(content_title)
+                            .border_style(if app.search_field_focus == 1 {
+                                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
+                            } else {
+                                ratatui::style::Style::default()
+                            }));
+                    f.render_widget(content_para, chunks[1]);
+
+                    // Help text
+                    let help_text = "Tab: switch fields  F1-F4: insert patterns  Ctrl+R: test regex\nEnter: search  Esc: cancel  Backspace: delete";
+                    let help_para = Paragraph::new(help_text)
+                        .block(Block::default().borders(Borders::ALL).title("Help"));
+                    f.render_widget(help_para, chunks[2]);
                 }
                 _ => {
                     ui::draw_main_ui(f, &mut app, f.size());
@@ -132,18 +178,40 @@ async fn main() -> Result<(), crate::core::error::AppError> {
 
                 match app.input_mode {
                     InputMode::Normal => match key.code {
-                        // Navigation
+                        // Ctrl+Arrow keys for pane switching (must come before regular arrow keys)
+                        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.search_results.is_empty() {
+                                app.focused_pane = FocusedPane::FileBrowser;
+                            }
+                        }
+                        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.search_results.is_empty() {
+                                app.focused_pane = FocusedPane::SearchResults;
+                            }
+                        }
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.search_results.is_empty() {
+                                app.focused_pane = FocusedPane::FileBrowser;
+                            }
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.search_results.is_empty() {
+                                app.focused_pane = FocusedPane::SearchResults;
+                            }
+                        }
+
+                        // Regular navigation (without Ctrl modifier)
                         KeyCode::Char('j') | KeyCode::Down => {
                             if !app.search_results.is_empty() && app.focused_pane == FocusedPane::SearchResults {
                                 app.navigate_search(true);
-                            } else {
+    } else {
                                 app.select_next();
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             if !app.search_results.is_empty() && app.focused_pane == FocusedPane::SearchResults {
                                 app.navigate_search(false);
-                            } else {
+                    } else {
                                 app.select_prev();
                             }
                         }
@@ -159,7 +227,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                             if !app.search_results.is_empty() && app.focused_pane == FocusedPane::SearchResults {
                                 let _ = app.jump_to_grep_result();
-                            } else {
+        } else {
                                 if let Err(e) = app.enter_dir() {
                                     app.status_message = Some(format!("Cannot enter directory: {}", get_user_friendly_error(&e)));
                                 }
@@ -167,19 +235,13 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
 
                         // Search
-                        KeyCode::Char('/') => {
+                        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.search_config = Some(crate::core::app::SearchConfig {
-                                kind: crate::core::app::SearchKind::Name,
-                                regex_mode: false,
+                                filename_regex: Some(String::new()),
+                                content_regex: Some(String::new()),
                             });
                             app.input_mode = InputMode::Search;
-                        }
-                        KeyCode::Char('c') => {
-                            app.search_config = Some(crate::core::app::SearchConfig {
-                                kind: crate::core::app::SearchKind::Content,
-                                regex_mode: false,
-                            });
-                            app.input_mode = InputMode::Search;
+                            app.search_field_focus = 0; // Start with filename field
                         }
 
                         // Remote connections
@@ -219,7 +281,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if !app.search_results.is_empty() {
                                 app.clear_search();
-                            } else {
+                    } else {
                                 break;
                             }
                         }
@@ -232,7 +294,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.navigate_connection_list(false);
                             }
-                            KeyCode::Enter => {
+                KeyCode::Enter => {
                             if let Err(e) = app.connect_to_selected() {
                                 app.status_message = Some(format!("Connection failed: {}", get_user_friendly_error(&e)));
                             }
@@ -243,20 +305,20 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('d') => {
                             if let Err(e) = app.delete_selected_connection() {
                                 app.status_message = Some(format!("Delete failed: {}", get_user_friendly_error(&e)));
-                            }
-                        }
-                        KeyCode::Esc => {
-                            app.input_mode = InputMode::Normal;
-                        }
-                        _ => {}
                     }
+                }
+                KeyCode::Esc => {
+                    app.input_mode = InputMode::Normal;
+                }
+                _ => {}
+            }
                     InputMode::AddConnection(step) => match key.code {
                         KeyCode::Enter => {
                             if app.next_add_connection_step() {
                                 // Connection completed
                                         app.input_mode = InputMode::ConnectionList;
                                     }
-                                }
+                        }
                         KeyCode::Char(c) => {
                             app.update_new_connection(step, c);
                         }
@@ -266,74 +328,125 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                             KeyCode::Esc => {
                                 app.input_mode = InputMode::ConnectionList;
                             }
-                            _ => {}
-                        }
+                                    _ => {}
+                                }
                     InputMode::Search => match key.code {
                         KeyCode::Char(c) => {
                             // Handle special key combinations
                             if key.modifiers.contains(KeyModifiers::CONTROL) {
                                 match c {
                                     'r' => {
-                                        // Toggle regex mode
-                                        if let Some(ref mut config) = app.search_config {
-                                            config.regex_mode = !config.regex_mode;
-                                        }
+                                        // Test regex (could show matches in a sample)
+                                        // For now, just show a message
+                                        app.status_message = Some("Regex testing not yet implemented".to_string());
                                     }
                                     _ => {}
                                 }
-                            } else {
-                                app.search_query.push(c);
+        } else {
+                                // Add character to the focused field
+                                if let Some(ref mut config) = app.search_config {
+                                    let field = if app.search_field_focus == 0 {
+                                        &mut config.filename_regex
+        } else {
+                                        &mut config.content_regex
+                                    };
+                                    if let Some(ref mut field_value) = field {
+                                        field_value.push(c);
+                                    }
+                                }
                             }
                         }
                         KeyCode::Backspace => {
-                            // Ensure Backspace only removes characters, not adds them
-                            let _ = app.search_query.pop();
+                            // Remove character from the focused field
+                            if let Some(ref mut config) = app.search_config {
+                                let field = if app.search_field_focus == 0 {
+                                    &mut config.filename_regex
+        } else {
+                                    &mut config.content_regex
+                                };
+                                if let Some(ref mut field_value) = field {
+                                    let _ = field_value.pop();
+                                }
+                            }
+                        }
+                        KeyCode::Tab => {
+                            // Switch between filename and content fields
+                            app.search_field_focus = 1 - app.search_field_focus;
                         }
                         KeyCode::F(1) => {
                             // Word boundary pattern
-                            if app.search_config.map_or(false, |c| c.regex_mode) {
-                                app.search_query.push_str(r"\b\w+\b");
-                            } else {
-                                app.search_query.push_str("*");
+                            if let Some(ref mut config) = app.search_config {
+                                let pattern = r"\b\w+\b";
+                                let field = if app.search_field_focus == 0 {
+                                    &mut config.filename_regex
+        } else {
+                                    &mut config.content_regex
+                                };
+                                if let Some(ref mut field_value) = field {
+                                    field_value.push_str(pattern);
+                                }
                             }
                         }
                         KeyCode::F(2) => {
                             // Digits pattern
-                            if app.search_config.map_or(false, |c| c.regex_mode) {
-                                app.search_query.push_str(r"\d+");
-                            } else {
-                                app.search_query.push_str("[0-9]");
+                            if let Some(ref mut config) = app.search_config {
+                                let pattern = r"\d+";
+                                let field = if app.search_field_focus == 0 {
+                                    &mut config.filename_regex
+    } else {
+                                    &mut config.content_regex
+                                };
+                                if let Some(ref mut field_value) = field {
+                                    field_value.push_str(pattern);
+                                }
                             }
                         }
                         KeyCode::F(3) => {
                             // File extension pattern
-                            if app.search_config.map_or(false, |c| c.regex_mode) {
-                                app.search_query.push_str(r"\.[a-zA-Z0-9]+$");
-                            } else {
-                                app.search_query.push_str(".*");
+                            if let Some(ref mut config) = app.search_config {
+                                let pattern = if app.search_field_focus == 0 {
+                                    r"\.[a-zA-Z0-9]+$"
+        } else {
+                                    r"\.[a-zA-Z0-9]+"
+                                };
+                                let field = if app.search_field_focus == 0 {
+                                    &mut config.filename_regex
+        } else {
+                                    &mut config.content_regex
+                                };
+                                if let Some(ref mut field_value) = field {
+                                    field_value.push_str(pattern);
+                                }
                             }
                         }
                         KeyCode::F(4) => {
                             // Path separator pattern
-                            if app.search_config.map_or(false, |c| c.regex_mode) {
-                                app.search_query.push_str(r"[/\\]");
-                            } else {
-                                app.search_query.push_str("/");
+                            if let Some(ref mut config) = app.search_config {
+                                let pattern = r"[/\\]";
+                                let field = if app.search_field_focus == 0 {
+                                    &mut config.filename_regex
+                                } else {
+                                    &mut config.content_regex
+                                };
+                                if let Some(ref mut field_value) = field {
+                                    field_value.push_str(pattern);
+                                }
                             }
                         }
-                        KeyCode::Enter => {
-                            if let Err(e) = app.perform_search() {
-                                app.status_message = Some(format!("Search failed: {}", get_user_friendly_error(&e)));
-                                app.input_mode = InputMode::Normal;
-                            }
-                        }
-                        KeyCode::Esc => {
-                            app.input_mode = InputMode::Normal;
-                            app.cancel_search(true);
-                        }
-                        _ => {}
+                KeyCode::Enter => {
+                    if let Err(e) = app.perform_search() {
+                        app.status_message = Some(format!("Search failed: {}", get_user_friendly_error(&e)));
+                        app.input_mode = InputMode::Normal;
                     }
-                    _ => {}
+                    // perform_search() already sets input_mode to Normal on success
+                }
+                KeyCode::Esc => {
+                    app.input_mode = InputMode::Normal;
+                            app.cancel_search(true);
+                }
+                _ => {}
+            }
+                                    _ => {}
                 }
             }
         }
