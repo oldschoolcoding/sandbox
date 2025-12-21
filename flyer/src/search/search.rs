@@ -68,24 +68,33 @@ pub async fn perform_remote_search_async(
         SearchKind::Name => {
             // Use fd (faster than find) if available, fallback to find
             if check_command_available(&session, "fd") {
-                format!("cd '{}' && fd -t f '{}'", current_path_str, search_query)
+                if config.regex_mode {
+                    format!("cd '{}' && fd -t f --regex '{}'", current_path_str, search_query)
+                } else {
+                    format!("cd '{}' && fd -t f '{}'", current_path_str, search_query)
+                }
             } else {
-                format!("find '{}' -type f -name '*{}*'", current_path_str, search_query)
+                if config.regex_mode {
+                    format!("find '{}' -type f -regextype posix-extended -regex '.*/.*{}.*'", current_path_str, search_query)
+                } else {
+                    format!("find '{}' -type f -name '*{}*'", current_path_str, search_query)
+                }
             }
         }
         SearchKind::Content => {
             // Prioritize ripgrep (like Yazi), then grep
+            let fixed_strings_flag = if config.regex_mode { "" } else { " -F" };
             if check_command_available(&session, "rg") {
                 let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
                 format!(
-                    "cd '{}' && rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
-                    current_path_str, search_query
+                    "cd '{}' && rg{} --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
+                    current_path_str, fixed_strings_flag, search_query
                 )
             } else if check_command_available(&session, "grep") {
                 let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
                 format!(
-                    "cd '{}' && grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
-                    current_path_str, search_query
+                    "cd '{}' && grep{} -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
+                    current_path_str, fixed_strings_flag, search_query
                 )
             } else {
                 let _ = tx.send(SearchResult::Error("No grep tools available".into()));

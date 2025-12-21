@@ -70,6 +70,7 @@ pub enum FocusedPane {
 #[derive(Clone, Copy)]
 pub struct SearchConfig {
     pub kind: SearchKind,
+    pub regex_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -536,7 +537,7 @@ impl App {
 
     fn start_search(&mut self, kind: SearchKind) {
         self.input_mode = InputMode::Search;
-        self.search_config = Some(SearchConfig { kind });
+        self.search_config = Some(SearchConfig { kind, regex_mode: false });
         self.search_query.clear();
         self.clear_search();
     }
@@ -556,7 +557,11 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
     let config = self.search_config.expect("search config missing");
     let current_path_str = self.current_path.display().to_string();
 
-    let re = match Regex::new(&regex::escape(&self.search_query)) {
+    let re = match if config.regex_mode {
+        Regex::new(&self.search_query)
+    } else {
+        Regex::new(&regex::escape(&self.search_query))
+    } {
         Ok(r) => r,
         Err(e) => {
             self.status_message = Some(format!("Invalid regex: {}", e));
@@ -573,7 +578,11 @@ fn perform_remote_search(&mut self) -> Result<(), AppError> {
     if config.kind == SearchKind::Name {
         // Fast name search with find -regex
         self.status_message = Some("Executing remote find command...".into());
-        let name_pattern = format!(r".*{}.*", regex::escape(&self.search_query));
+        let name_pattern = if config.regex_mode {
+            format!(r".*{}.*", self.search_query)
+        } else {
+            format!(r".*{}.*", regex::escape(&self.search_query))
+        };
 
         let cmd = format!(
             "find '{}' -type f -regextype posix-extended -regex '{}'",

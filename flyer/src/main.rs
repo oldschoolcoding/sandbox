@@ -102,9 +102,20 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                     ui::draw_add_connection(f, &app, f.size(), step);
                 }
                 InputMode::Search => {
-                    let query_display = format!("Search: {}_", app.search_query);
-                    let para = ratatui::widgets::Paragraph::new(query_display)
-                        .block(ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title("Search"));
+                    let mode_indicator = if app.search_config.map_or(false, |c| c.regex_mode) { "[REGEX]" } else { "[TEXT]" };
+                    let kind_indicator = match app.search_config.map(|c| c.kind) {
+                        Some(crate::core::app::SearchKind::Name) => "NAME",
+                        Some(crate::core::app::SearchKind::Content) => "CONTENT",
+                        None => "UNKNOWN",
+                    };
+                    let title = format!("Search ({}{}) - Ctrl+R: toggle regex, F1-F4: patterns", kind_indicator, mode_indicator);
+                    let query_display = format!("{}{}", app.search_query, if app.search_query.is_empty() { "_" } else { "|" });
+
+                    let help_text = "\nF1: word boundary  F2: digits  F3: extension  F4: path separator\nEsc: cancel  Enter: search  Backspace: delete";
+                    let full_display = format!("{}{}", query_display, help_text);
+
+                    let para = ratatui::widgets::Paragraph::new(full_display)
+                        .block(ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title(title));
                     f.render_widget(para, f.size());
                 }
                 _ => {
@@ -159,12 +170,14 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('/') => {
                             app.search_config = Some(crate::core::app::SearchConfig {
                                 kind: crate::core::app::SearchKind::Name,
+                                regex_mode: false,
                             });
                             app.input_mode = InputMode::Search;
                         }
                         KeyCode::Char('c') => {
                             app.search_config = Some(crate::core::app::SearchConfig {
                                 kind: crate::core::app::SearchKind::Content,
+                                regex_mode: false,
                             });
                             app.input_mode = InputMode::Search;
                         }
@@ -257,10 +270,56 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
                     InputMode::Search => match key.code {
                         KeyCode::Char(c) => {
-                            app.search_query.push(c);
+                            // Handle special key combinations
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                match c {
+                                    'r' => {
+                                        // Toggle regex mode
+                                        if let Some(ref mut config) = app.search_config {
+                                            config.regex_mode = !config.regex_mode;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                app.search_query.push(c);
+                            }
                         }
                         KeyCode::Backspace => {
-                            app.search_query.pop();
+                            // Ensure Backspace only removes characters, not adds them
+                            let _ = app.search_query.pop();
+                        }
+                        KeyCode::F(1) => {
+                            // Word boundary pattern
+                            if app.search_config.map_or(false, |c| c.regex_mode) {
+                                app.search_query.push_str(r"\b\w+\b");
+                            } else {
+                                app.search_query.push_str("*");
+                            }
+                        }
+                        KeyCode::F(2) => {
+                            // Digits pattern
+                            if app.search_config.map_or(false, |c| c.regex_mode) {
+                                app.search_query.push_str(r"\d+");
+                            } else {
+                                app.search_query.push_str("[0-9]");
+                            }
+                        }
+                        KeyCode::F(3) => {
+                            // File extension pattern
+                            if app.search_config.map_or(false, |c| c.regex_mode) {
+                                app.search_query.push_str(r"\.[a-zA-Z0-9]+$");
+                            } else {
+                                app.search_query.push_str(".*");
+                            }
+                        }
+                        KeyCode::F(4) => {
+                            // Path separator pattern
+                            if app.search_config.map_or(false, |c| c.regex_mode) {
+                                app.search_query.push_str(r"[/\\]");
+                            } else {
+                                app.search_query.push_str("/");
+                            }
                         }
                         KeyCode::Enter => {
                             if let Err(e) = app.perform_search() {
