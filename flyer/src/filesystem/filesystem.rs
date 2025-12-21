@@ -112,7 +112,9 @@ impl FileSystemOperations for LocalFileSystem {
         use std::io::BufRead;
         let f = std::fs::File::open(p)?;
         let reader = std::io::BufReader::new(f);
-        let mut lines = Vec::with_capacity(count);
+        // Limit capacity to prevent overflow, but allow reasonable growth
+        let capacity = std::cmp::min(count, 10_000);
+        let mut lines = Vec::with_capacity(capacity);
         for (i, line) in reader.lines().enumerate() {
             if i < start { continue; }
             if i >= start + count { break; }
@@ -148,6 +150,19 @@ pub struct SftpFileSystem {
     pub username: String,
     pub password: String,
     pub port: u16,
+}
+
+impl SftpFileSystem {
+    fn normalize_path(&self, p: &Path) -> std::path::PathBuf {
+        let path_str = p.to_string_lossy();
+        if path_str == "." {
+            std::path::PathBuf::from(".")
+        } else {
+            // Remove leading "./" if present
+            let normalized = path_str.strip_prefix("./").unwrap_or(&path_str);
+            std::path::PathBuf::from(normalized)
+        }
+    }
 }
 
 impl SftpFileSystem {
@@ -203,8 +218,10 @@ fn format_permissions_sftp(stat: &ssh2::FileStat) -> String {
 
 impl FileSystemOperations for SftpFileSystem {
     fn read_dir(&self, p: &Path) -> Result<Vec<FileEntry>, AppError> {
+        let sftp_path = self.normalize_path(p);
         let mut entries = vec![];
-        for (path, stat) in self.sftp.readdir(p)? {
+
+        for (path, stat) in self.sftp.readdir(&sftp_path)? {
             let mode = stat.perm.unwrap_or(0);
             let file_type = mode & S_IFMT;
             let is_dir = file_type == S_IFDIR;
@@ -225,11 +242,13 @@ impl FileSystemOperations for SftpFileSystem {
     }
 
     fn open_file(&self, p: &Path) -> Result<Box<dyn Read>, AppError> {
-        Ok(Box::new(self.sftp.open(p)?))
+        let sftp_path = self.normalize_path(p);
+        Ok(Box::new(self.sftp.open(&sftp_path)?))
     }
 
     fn read_file_head(&self, p: &Path) -> Result<Vec<u8>, AppError> {
-        let mut f = self.sftp.open(p)?;
+        let sftp_path = self.normalize_path(p);
+        let mut f = self.sftp.open(&sftp_path)?;
         let mut buf = vec![0; 512];
         let n = f.read(&mut buf)?;
         buf.truncate(n);
@@ -238,9 +257,12 @@ impl FileSystemOperations for SftpFileSystem {
 
     fn read_file_chunk(&self, p: &Path, start: usize, count: usize) -> Result<Vec<String>, AppError> {
         use std::io::BufRead;
-        let f = self.sftp.open(p)?;
+        let sftp_path = self.normalize_path(p);
+        let f = self.sftp.open(&sftp_path)?;
         let reader = std::io::BufReader::new(f);
-        let mut lines = Vec::with_capacity(count);
+        // Limit capacity to prevent overflow, but allow reasonable growth
+        let capacity = std::cmp::min(count, 10_000);
+        let mut lines = Vec::with_capacity(capacity);
         for (i, line) in reader.lines().enumerate() {
             if i < start { continue; }
             if i >= start + count { break; }
@@ -250,7 +272,8 @@ impl FileSystemOperations for SftpFileSystem {
     }
 
     fn get_file_properties(&self, p: &Path) -> Result<FileProperties, AppError> {
-        let stat = self.sftp.stat(p)?;
+        let sftp_path = self.normalize_path(p);
+        let stat = self.sftp.stat(&sftp_path)?;
         let perm = format_permissions_sftp(&stat);
         let modified = {
             use chrono::{DateTime, Local};

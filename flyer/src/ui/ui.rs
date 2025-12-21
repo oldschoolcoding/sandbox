@@ -289,7 +289,7 @@ fn draw_content_section(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or("Unknown");
 
             let content = format!(
-                "📁 Directory: {}\n\nThis is a directory containing files and subdirectories.\n\nPress Enter to navigate into this directory.\nPress h to go back to parent directory.",
+                "📁 Directory: {}\n\nThis is a directory containing files and subdirectories.\n\nPress l or Enter to navigate into this directory.\nPress h to go back to parent directory.",
                 file_name
             );
 
@@ -301,18 +301,50 @@ fn draw_content_section(f: &mut Frame, app: &App, area: Rect) {
                 .wrap(ratatui::widgets::Wrap { trim: true });
             f.render_widget(para, area);
         } else {
-            // For files, show content if available
+            // For files, show content with scrolling support
             if !app.file_content.is_empty() {
                 let content = app.file_content.join("\n");
-                let para = Paragraph::new(content)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .title(" File Content ")
-                        .border_style(Style::default().fg(Color::Green)))
-                    .wrap(ratatui::widgets::Wrap { trim: true });
-                f.render_widget(para, area);
+
+                // Calculate visible lines based on area height
+                let area_height = area.height as usize;
+                let visible_lines = area_height.saturating_sub(2); // Subtract border lines
+
+                // Create scrollable content
+                let display_content = content;
+
+                // Add scroll indicators if content is scrollable
+                if app.file_content.len() > visible_lines {
+                    let scroll_percent = if app.content_total_lines > 0 {
+                        (app.content_scroll as f64 / app.content_total_lines as f64 * 100.0) as usize
+                    } else {
+                        0
+                    };
+
+                    let title = if app.content_loaded {
+                        format!(" File Content ({}/{}) ", app.content_scroll + visible_lines, app.file_content.len())
+                    } else {
+                        format!(" File Content ({}% loaded, ↑↓ to scroll) ", scroll_percent)
+                    };
+
+                    let para = Paragraph::new(display_content)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(Color::Green)))
+                        .scroll((app.content_scroll as u16, 0));
+                    f.render_widget(para, area);
+                } else {
+                    let title = format!(" File Content ({}) ", app.file_content.len());
+                    let para = Paragraph::new(display_content)
+                        .block(Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(Color::Green)))
+                        .wrap(ratatui::widgets::Wrap { trim: true });
+                    f.render_widget(para, area);
+                }
             } else {
-                // File not loaded yet
+                // File content is being loaded
                 let file_name = entry.path.file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("Unknown");
@@ -320,7 +352,7 @@ fn draw_content_section(f: &mut Frame, app: &App, area: Rect) {
                 let (icon, color) = get_file_icon_and_color(&entry.path, false, file_name.starts_with('.'));
 
                 let content = format!(
-                    "{} {}\n\nFile content not loaded.\n\nPress Enter to load and view file content.\nThis will display text files or show a preview for other file types.",
+                    "{} {}\n\nLoading file content...",
                     icon,
                     Span::styled(file_name, Style::default().fg(color).add_modifier(Modifier::BOLD)).to_string()
                 );

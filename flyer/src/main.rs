@@ -10,7 +10,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::{backend::CrosstermBackend, Terminal, style::Style};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use crate::core::app::{App, FocusedPane};
 use crate::core::InputMode;
 use crate::core::error::AppError;
@@ -155,7 +155,11 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
                         KeyCode::Char('h') | KeyCode::Left => {
                             if let Err(e) = app.leave_dir() {
-                                app.status_message = Some(format!("Cannot go up: {}", get_user_friendly_error(&e)));
+                                let error_msg = match &e {
+                                    AppError::Navigation(msg) => msg.clone(),
+                                    _ => format!("Cannot go up: {}", get_user_friendly_error(&e)),
+                                };
+                                app.status_message = Some(error_msg);
                             }
                         }
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
@@ -170,6 +174,9 @@ async fn main() -> Result<(), crate::core::error::AppError> {
 
                         // Search
                         KeyCode::Char('/') => {
+                            app.search_config = Some(crate::core::app::SearchConfig {
+                                kind: crate::core::app::SearchKind::Name,
+                            });
                             app.input_mode = InputMode::Search;
                         }
                         KeyCode::Char('c') => {
@@ -182,6 +189,24 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         // Remote connections
                         KeyCode::Char('r') => {
                             app.input_mode = InputMode::ConnectionList;
+                        }
+
+                        // Content scrolling (when a file is selected)
+                        KeyCode::PageUp => {
+                            app.scroll_content_up();
+                        }
+                        KeyCode::PageDown => {
+                            app.scroll_content_down();
+                        }
+                        KeyCode::Char('u') => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.scroll_content_up();
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.scroll_content_down();
+                            }
                         }
 
                         // Quit
@@ -252,6 +277,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
                         KeyCode::Esc => {
                             app.input_mode = InputMode::Normal;
+                            app.cancel_search(true);
                         }
                         _ => {}
                     }

@@ -107,6 +107,9 @@ pub struct App {
     pub focused_pane: FocusedPane,
     pub status_message: Option<String>,
     pub file_content: Vec<String>,
+    pub content_scroll: usize, // Scroll position for content pane
+    pub content_loaded: bool,  // Whether content is fully loaded
+    pub content_total_lines: usize, // Total lines available (for large files)
     pub input_mode: InputMode,
     pub search_query: String,
     pub search_results: Vec<Line<'static>>,
@@ -141,6 +144,9 @@ impl App {
             focused_pane: FocusedPane::FileBrowser,
             status_message: None,
             file_content: vec![],
+            content_scroll: 0,
+            content_loaded: false,
+            content_total_lines: 0,
             input_mode: InputMode::Normal,
             search_query: String::new(),
             search_results: vec![],
@@ -172,14 +178,15 @@ impl App {
     fn refresh_entries(&mut self) -> Result<(), AppError> {
         self.entries = self.fs_ops.read_dir(&self.current_path)?;
         self.content_cache.clear();
-        
+
         if self.entries.is_empty() {
             self.table_state.select(None);
         } else {
             let i = self.table_state.selected().unwrap_or(0).min(self.entries.len() - 1);
             self.table_state.select(Some(i));
+            // Auto-load content for the selected item
+            self.on_selection_changed();
         }
-        self.mark_content_dirty();
         Ok(())
     }
 
@@ -232,7 +239,7 @@ impl App {
             None => 0,
         };
         self.table_state.select(Some(i));
-        self.mark_content_dirty();
+        self.on_selection_changed();
     }
 
     pub fn select_next(&mut self) {
@@ -241,7 +248,27 @@ impl App {
             None => 0,
         };
         self.table_state.select(Some(i));
+        self.on_selection_changed();
+    }
+
+    pub fn on_selection_changed(&mut self) {
         self.mark_content_dirty();
+        self.content_scroll = 0; // Reset scroll position
+
+        // Auto-load content for selected file
+        if let Some(i) = self.table_state.selected() {
+            if let Some(entry) = self.entries.get(i) {
+                if !entry.is_dir {
+                    // Load file content asynchronously
+                    let _ = self.load_file_content_async();
+                } else {
+                    // Clear content for directories
+                    self.file_content.clear();
+                    self.content_loaded = true;
+                    self.content_total_lines = 0;
+                }
+            }
+        }
     }
 
     pub fn enter_dir(&mut self) -> Result<(), AppError> {
@@ -252,23 +279,56 @@ impl App {
                 self.clear_search();
             } else {
                 // Load file content for selected file
-                self.load_file_content()?;
+                self.load_file_content_async()?;
             }
         }
         Ok(())
     }
 
-    pub fn load_file_content(&mut self) -> Result<(), AppError> {
+    pub fn load_file_content_async(&mut self) -> Result<(), AppError> {
         if let Some(i) = self.table_state.selected() {
             if !self.entries[i].is_dir {
-                // Try to read the file content
-                match self.fs_ops.read_file_chunk(&self.entries[i].path, 0, 100) {
+                let path = self.entries[i].path.clone();
+
+                // First, try to get basic file info to determine size
+                match self.fs_ops.get_file_properties(&path) {
+                    Ok(props) => {
+                        // Parse size to estimate line count (rough estimate: 50 chars per line)
+                        let estimated_lines = props.size.parse::<usize>().unwrap_or(0) / 50;
+
+                        if estimated_lines > 1000 {
+                            // Large file - load first chunk only
+                            self.load_file_chunk(0, 100)?;
+                            self.content_loaded = false;
+                            self.content_total_lines = estimated_lines;
+                        } else {
+                            // Small file - load all content
+                            self.load_file_chunk(0, usize::MAX)?;
+                            self.content_loaded = true;
+                            self.content_total_lines = self.file_content.len();
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback: try to load first chunk
+                        self.load_file_chunk(0, 100)?;
+                        self.content_loaded = false;
+                        self.content_total_lines = 100; // Unknown
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_file_chunk(&mut self, start_line: usize, max_lines: usize) -> Result<(), AppError> {
+        if let Some(i) = self.table_state.selected() {
+            if !self.entries[i].is_dir {
+                match self.fs_ops.read_file_chunk(&self.entries[i].path, start_line, max_lines) {
                     Ok(content) => {
                         self.file_content = content;
                         self.mark_content_dirty();
                     }
                     Err(e) => {
-                        // If we can't read as text, just show an error message
                         self.file_content = vec![format!("Cannot display file content: {}", get_user_friendly_error(&e))];
                         self.mark_content_dirty();
                     }
@@ -278,8 +338,56 @@ impl App {
         Ok(())
     }
 
+    pub fn scroll_content_up(&mut self) {
+        if self.content_scroll > 0 {
+            self.content_scroll = self.content_scroll.saturating_sub(5);
+        }
+    }
+
+    pub fn scroll_content_down(&mut self) {
+        let max_scroll = self.file_content.len().saturating_sub(20); // Leave some margin
+        if self.content_scroll < max_scroll {
+            self.content_scroll += 5;
+        } else if !self.content_loaded && self.file_content.len() >= 20 {
+            // Load more content if available
+            let next_start = self.file_content.len();
+            let _ = self.load_file_chunk(next_start, 100);
+        }
+    }
+
     pub fn leave_dir(&mut self) -> Result<(), AppError> {
+        // For remote connections, handle navigation differently
+        if self.is_remote() {
+            let components: Vec<_> = self.current_path.components().collect();
+
+            if components.len() <= 1 {
+                // We're at the initial directory ("."), go up to "/"
+                self.current_path = PathBuf::from("/");
+                self.refresh_entries()?;
+                self.clear_search();
+                return Ok(());
+            }
+
+            // Pop the last component for deeper navigation
+            if self.current_path.pop() {
+                // For remote, ensure we don't end up with an empty path
+                if self.current_path.as_os_str().is_empty() {
+                    self.current_path = PathBuf::from("/");
+                }
+
+                self.refresh_entries()?;
+                self.clear_search();
+            }
+            return Ok(());
+        }
+
+        // For local filesystem
         if self.current_path.pop() {
+            // After popping, ensure we don't go above root
+            if self.current_path.as_os_str().is_empty() {
+                self.current_path = PathBuf::from("/");
+            }
+
             self.refresh_entries()?;
             self.clear_search();
         }
@@ -409,7 +517,7 @@ impl App {
         }
     }
 
-    fn cancel_search(&mut self, clear_config: bool) {
+    pub fn cancel_search(&mut self, clear_config: bool) {
         // Abort the search task if running
         if let Some(task) = self.search_task.take() {
             task.abort();
@@ -600,7 +708,7 @@ pub fn perform_search(&mut self) -> Result<(), AppError> {
 
         if let Some((host, username, password, port)) = connection_details {
             let task = task::spawn(async move {
-                perform_remote_search_async(host, username, password, port, search_query, search_config, current_path.clone(), tx);
+                let _ = perform_remote_search_async(host, username, password, port, search_query, search_config, current_path.clone(), tx).await;
             });
             self.search_task = Some(task);
         } else {
