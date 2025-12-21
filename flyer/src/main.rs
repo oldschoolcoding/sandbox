@@ -1,6 +1,6 @@
 use std::os::unix::fs::PermissionsExt;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -21,9 +21,11 @@ use std::{
 };
 use thiserror::Error;
 use chrono::prelude::*;
-use infer;
 use users::{get_user_by_uid, get_group_by_gid};
 use regex::Regex;
+use indicatif::{ProgressBar, ProgressStyle};
+use tokio::sync::mpsc;
+use tokio::task;
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
@@ -38,11 +40,17 @@ const DEBOUNCE_MS: u64 = 150;
 const MAX_CACHE_SIZE: usize = 50;
 const CONNECTIONS_FILE: &str = "connections.enc";
 
+#[derive(Debug)]
+enum SearchResult {
+    Found(Line<'static>),
+    Finished,
+    Error(String),
+}
+
 // Constants for Unix file type masks
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
-const S_IFREG: u32 = 0o100000;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -207,7 +215,9 @@ trait FileSystemOperations: Any {
     fn read_dir(&self, p: &Path) -> Result<Vec<FileEntry>, AppError>;
     fn get_start_path(&self) -> Result<PathBuf, AppError>;
     fn path_to_string(&self, p: &Path) -> String;
+    #[allow(dead_code)]
     fn open_file(&self, p: &Path) -> Result<Box<dyn Read>, AppError>;
+    #[allow(dead_code)]
     fn read_file_head(&self, p: &Path) -> Result<Vec<u8>, AppError>;
     fn read_file_chunk(&self, p: &Path, s: usize, c: usize) -> Result<Vec<String>, AppError>;
     fn get_file_properties(&self, p: &Path) -> Result<FileProperties, AppError>;
@@ -445,12 +455,12 @@ impl FileSystemOperations for SftpFileSystem {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+#[derive(Debug)]
 enum SearchKind { Name, Content }
 
 #[derive(Clone, Copy)]
 struct SearchConfig {
     kind: SearchKind,
-    max_depth: usize,
 }
 
 #[derive(PartialEq)]
@@ -483,6 +493,8 @@ struct App {
     search_query: String,
     search_results: Vec<Line<'static>>,
     search_config: Option<SearchConfig>,
+    search_receiver: Option<mpsc::UnboundedReceiver<SearchResult>>,
+    search_task: Option<task::JoinHandle<()>>,
     content_cache: HashMap<PathBuf, Vec<String>>,
     last_selection_time: Instant,
     pending_selection: Option<usize>,
@@ -512,6 +524,8 @@ impl App {
             search_query: String::new(),
             search_results: vec![],
             search_config: None,
+            search_receiver: None,
+            search_task: None,
             content_cache: HashMap::new(),
             last_selection_time: Instant::now(),
             pending_selection: None,
@@ -631,129 +645,226 @@ impl App {
         self.search_list_state.select(None);
     }
 
-    fn start_search(&mut self, kind: SearchKind, max_depth: usize) {
+    fn cancel_search(&mut self, clear_config: bool) {
+        // Abort the search task if running
+        if let Some(task) = self.search_task.take() {
+            task.abort();
+        }
+
+        // Clear the receiver
+        self.search_receiver = None;
+
+        self.clear_search();
+        if clear_config {
+            self.search_config = None;
+            self.search_query.clear();
+        }
+        self.status_message = Some("Search cancelled".into());
+    }
+
+    fn start_search(&mut self, kind: SearchKind) {
         self.input_mode = InputMode::Search;
-        self.search_config = Some(SearchConfig { kind, max_depth });
+        self.search_config = Some(SearchConfig { kind });
         self.search_query.clear();
         self.clear_search();
     }
 
-    fn check_interrupt(&self) -> Result<(), AppError> {
-        if event::poll(std::time::Duration::from_millis(0))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press && k.code == KeyCode::Esc {
-                    return Err(AppError::Navigation("Search interrupted".into()));
-                }
+
+// Helper: is the current filesystem remote?
+fn is_remote(&self) -> bool {
+    self.fs_ops.as_any().is::<SftpFileSystem>()
+}
+
+
+
+
+// Replace the old search_at_depth + perform_search logic
+fn perform_search(&mut self) -> Result<(), AppError> {
+    if self.search_query.is_empty() {
+        self.clear_search();
+        self.input_mode = InputMode::Normal;
+        return Ok(());
+    }
+
+    // Clone necessary data for the async task BEFORE cancelling
+    let search_query = self.search_query.clone();
+    let search_config = self.search_config.clone();
+    let current_path = self.current_path.clone();
+    let is_remote = self.is_remote();
+
+    // Cancel any existing search
+    self.cancel_search(false);
+
+    // Clear previous results and start fresh
+    self.search_results.clear();
+    self.search_list_state.select(None);
+
+    // Create channel for search results
+    let (tx, rx) = mpsc::unbounded_channel();
+    self.search_receiver = Some(rx);
+
+    // Spawn async search task
+    let task = if is_remote {
+        // For remote searches, we need to access the SFTP session
+        // For now, implement basic synchronous remote search in async context
+        task::spawn(async move {
+            Self::perform_remote_search_sync(search_query, search_config, tx);
+        })
+    } else {
+        // Local search in async task
+        task::spawn(async move {
+            Self::perform_local_search_async(search_query, search_config, current_path, tx).await;
+        })
+    };
+
+    self.search_task = Some(task);
+    self.input_mode = InputMode::Normal;
+    Ok(())
+}
+
+async fn perform_local_search_async(
+    search_query: String,
+    search_config: Option<SearchConfig>,
+    current_path: PathBuf,
+    tx: mpsc::UnboundedSender<SearchResult>,
+) {
+    let config = match search_config {
+        Some(c) => c,
+        None => {
+            let _ = tx.send(SearchResult::Error("No search config provided".into()));
+            return;
+        }
+    };
+
+    let current_path_str = current_path.display().to_string();
+
+    if config.kind == SearchKind::Name {
+        // Create a regex pattern that matches any file whose name contains the search query
+        let name_pattern = format!(r".*{}.*", regex::escape(&search_query));
+
+        let cmd = format!(
+            "find '{}' -type f -regextype posix-extended -regex '{}'",
+            current_path_str,
+            name_pattern
+        );
+
+        let output = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tx.send(SearchResult::Error(format!("Command failed: {}", e)));
+                return;
             }
-        }
-        Ok(())
-    }
-
-    fn add_name_match(&self, out: &mut Vec<Line<'static>>, full: &str, is_dir: bool) {
-        let path_display = if is_dir {
-            format!("{full}/")
-        } else {
-            full.to_owned()
         };
-        let styled = if is_dir {
-            Span::styled(path_display, Style::default().fg(Color::Cyan))
-        } else {
-            Span::raw(path_display)
-        };
-        out.push(Line::from(vec![styled]));
-    }
 
-    fn add_content_match(&self, out: &mut Vec<Line<'static>>, full: &str, line_num: usize, line_text: &str, re: &Regex) {
-        let prefix = format!("{}:{:4}: ", full, line_num + 1);
-        let mut spans = vec![Span::raw(prefix)];
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let mut last = 0;
-        for m in re.find_iter(line_text) {
-            spans.push(Span::raw(line_text[last..m.start()].to_owned()));
-            spans.push(Span::styled(line_text[m.range()].to_owned(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
-            last = m.end();
-        }
-        spans.push(Span::raw(line_text[last..].to_owned()));
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
 
-        out.push(Line::from(spans));
-    }
-
-    fn search_at_depth(&self, path: &Path, re: &Regex, content_search: bool, out: &mut Vec<Line<'static>>, depth: usize, max_depth: usize) -> Result<(), AppError> {
-        if depth > max_depth { return Ok(()); }
-
-        for e in self.fs_ops.read_dir(path)? {
-            self.check_interrupt()?;
-            let name = e.path.file_name().unwrap().to_string_lossy();
-            let full = self.fs_ops.path_to_string(&e.path);
-
-            if e.is_dir {
-                if re.is_match(&name) {
-                    self.add_name_match(out, &full, true);
-                }
-                if depth < max_depth {
-                    self.search_at_depth(&e.path, re, content_search, out, depth + 1, max_depth)?;
-                }
+            let is_dir = line.ends_with('/');
+            let display = if is_dir { format!("{}/", line) } else { line.to_string() };
+            let styled = if is_dir {
+                Span::styled(display.clone(), Style::default().fg(Color::Cyan))
             } else {
-                if !content_search && re.is_match(&name) {
-                    self.add_name_match(out, &full, false);
-                }
-
-                if content_search {
-                    if let Ok(head) = self.fs_ops.read_file_head(&e.path) {
-                        if infer::get(&head).map_or(true, |k| k.mime_type().starts_with("text/")) {
-                            let lines = self.fs_ops.read_file_chunk(&e.path, 0, 10000).unwrap_or_default();
-                            for (i, line) in lines.iter().enumerate() {
-                                if re.is_match(line) {
-                                    self.add_content_match(out, &full, i, line, re);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                Span::raw(display)
+            };
+            let _ = tx.send(SearchResult::Found(Line::from(vec![styled])));
         }
-        Ok(())
-    }
+    } else {
+        // Use local grep command
+        let cmd = format!(
+            "grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}' '{}'",
+            search_query,
+            current_path_str
+        );
 
-    fn perform_search(&mut self) -> Result<(), AppError> {
-        if self.search_query.is_empty() {
-            self.clear_search();
-            self.input_mode = InputMode::Normal;
-            return Ok(());
-        }
-
-        let re = match Regex::new(&self.search_query) {
-            Ok(re) => re,
+        let output = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .await
+        {
+            Ok(o) => o,
             Err(e) => {
-                self.status_message = Some(format!("Invalid regex: {}", e));
-                self.input_mode = InputMode::Normal;
-                self.clear_search();
-                return Ok(());
+                let _ = tx.send(SearchResult::Error(format!("Command failed: {}", e)));
+                return;
             }
         };
-        let config = self.search_config.expect("search config missing");
-        let content_search = config.kind == SearchKind::Content;
-        let mut results = vec![];
 
-        match self.search_at_depth(&self.current_path, &re, content_search, &mut results, 0, config.max_depth) {
-            Ok(()) => {
-                self.search_results = results;
-                self.search_list_state.select(if self.search_results.is_empty() { None } else { Some(0) });
-                self.input_mode = InputMode::Normal;
-                Ok(())
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let re = match Regex::new(&regex::escape(&search_query)) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = tx.send(SearchResult::Error("Invalid regex".into()));
+                return;
             }
-            Err(e) => {
-                if let AppError::Navigation(ref msg) = e {
-                    if msg == "Search interrupted" {
-                        self.status_message = Some("Search interrupted".into());
-                        self.input_mode = InputMode::Normal;
-                        return Ok(());
+        };
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+
+            if line.contains(':') {
+                let parts: Vec<&str> = line.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    let full_path = parts[0];
+                    let line_num = parts[1];
+                    let text = parts[2];
+
+                    let mut spans = vec![
+                        Span::raw(format!("{}:{}: ", full_path, line_num))
+                    ];
+
+                    let mut last = 0;
+                    for m in re.find_iter(text) {
+                        spans.push(Span::raw(text[last..m.start()].to_owned()));
+                        spans.push(Span::styled(
+                            text[m.range()].to_owned(),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ));
+                        last = m.end();
                     }
+                    spans.push(Span::raw(text[last..].to_owned()));
+
+                    let _ = tx.send(SearchResult::Found(Line::from(spans)));
+                    continue;
                 }
-                Err(e)
             }
+
+            // Name matches or malformed lines
+            let is_dir = line.ends_with('/');
+            let display = if is_dir { format!("{}/", line) } else { line.to_string() };
+            let styled = if is_dir {
+                Span::styled(display.clone(), Style::default().fg(Color::Cyan))
+            } else {
+                Span::raw(display)
+            };
+            let _ = tx.send(SearchResult::Found(Line::from(vec![styled])));
         }
     }
+
+    let _ = tx.send(SearchResult::Finished);
+}
+
+fn perform_remote_search_sync(
+    search_query: String,
+    search_config: Option<SearchConfig>,
+    tx: mpsc::UnboundedSender<SearchResult>,
+) {
+    // For now, send a placeholder message for remote searches
+    let _ = tx.send(SearchResult::Error("Remote search not yet implemented".into()));
+    let _ = tx.send(SearchResult::Finished);
+}
+
+// Keep search_at_depth only for local fallback
+
 
     fn navigate_search(&mut self, down: bool) {
         if self.search_results.is_empty() { return; }
@@ -928,7 +1039,8 @@ fn draw_password_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn main() -> Result<(), AppError> {
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
     let mut app = App::new_local()?;
     
     // Prompt for master password to load connections
@@ -1136,8 +1248,7 @@ fn main() -> Result<(), AppError> {
                     let status = if app.input_mode == InputMode::Search {
                         let cfg = app.search_config.unwrap();
                         let kind = if cfg.kind == SearchKind::Content { "content" } else { "name" };
-                        let depth = if cfg.max_depth == usize::MAX { "unlimited" } else { &format!("depth {}", cfg.max_depth) };
-                        format!("SEARCH ({} | {}): {}", kind, depth, app.search_query)
+                        format!("SEARCH ({}): {}", kind, app.search_query)
                     } else if !app.search_results.is_empty() {
                         "j/k ↑↓: navigate results | Enter: jump to | Esc: clear results | r: remote connections | q: quit".into()
                     } else if let Some(msg) = &app.status_message {
@@ -1151,6 +1262,33 @@ fn main() -> Result<(), AppError> {
             }
         })?;
 
+        // Handle incoming search results
+        let mut receiver_finished = false;
+        if let Some(rx) = &mut app.search_receiver {
+            while let Ok(result) = rx.try_recv() {
+                match result {
+                    SearchResult::Found(line) => {
+                        app.search_results.push(line);
+                        if app.search_results.len() == 1 {
+                            app.search_list_state.select(Some(0));
+                        }
+                    }
+                    SearchResult::Finished => {
+                        receiver_finished = true;
+                    }
+                    SearchResult::Error(msg) => {
+                        app.status_message = Some(format!("Search error: {}", msg));
+                        receiver_finished = true;
+                    }
+                }
+            }
+        }
+
+        if receiver_finished {
+            app.search_receiver = None;
+            app.search_task = None;
+        }
+
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
@@ -1161,18 +1299,10 @@ fn main() -> Result<(), AppError> {
                         KeyCode::Char('r') => app.show_connection_list(),
                         KeyCode::Char('h') => { let _ = app.leave_dir(); }
                         KeyCode::Char('l') | KeyCode::Enter => { let _ = app.enter_dir(); }
-                        KeyCode::Char('/') => app.start_search(SearchKind::Name, usize::MAX),
-                        KeyCode::Char('c') => app.start_search(SearchKind::Content, usize::MAX),
-                        KeyCode::Char(c) if ('0'..='9').contains(&c) => {
-                            let depth = c.to_digit(10).unwrap() as usize;
-                            app.start_search(SearchKind::Name, depth);
-                        }
-                        KeyCode::Char(c) => {
-                            let symbols = ")!@#$%^&*(";
-                            if let Some(pos) = symbols.chars().position(|s| s == c) {
-                                let depth = pos;
-                                app.start_search(SearchKind::Content, depth);
-                            }
+                        KeyCode::Char('/') => app.start_search(SearchKind::Name),
+                        KeyCode::Char('c') => app.start_search(SearchKind::Content),
+                        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cancel_search(false);
                         }
                         _ => {
                             if !app.search_results.is_empty() {
@@ -1180,7 +1310,7 @@ fn main() -> Result<(), AppError> {
                                     KeyCode::Char('j') | KeyCode::Down => app.navigate_search(true),
                                     KeyCode::Char('k') | KeyCode::Up => app.navigate_search(false),
                                     KeyCode::Enter => { let _ = app.jump_to_selected_result(); }
-                                    KeyCode::Esc => app.clear_search(),
+                                    KeyCode::Esc => app.cancel_search(true),
                                     _ => {}
                                 }
                             } else {
@@ -1196,11 +1326,6 @@ fn main() -> Result<(), AppError> {
                         KeyCode::Char(c) => app.search_query.push(c),
                         KeyCode::Backspace => { app.search_query.pop(); }
                         KeyCode::Enter => { let _ = app.perform_search(); }
-                        KeyCode::Esc => {
-                            app.input_mode = InputMode::Normal;
-                            app.search_query.clear();
-                            app.clear_search();
-                        }
                         _ => {}
                     },
                     InputMode::ConnectionList => match key.code {
