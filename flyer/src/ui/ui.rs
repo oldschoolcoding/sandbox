@@ -8,6 +8,7 @@ use ratatui::{
 use std::path::Path;
 use crate::core::app::{App, FocusedPane};
 use crate::network::connection::RemoteConnection;
+use crate::filesystem::{SftpFileSystem};
 
 fn get_file_icon_and_color(file_path: &Path, is_dir: bool, is_hidden: bool) -> (&'static str, Color) {
     if is_dir {
@@ -147,22 +148,95 @@ pub fn draw_main_ui(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50), // Left pane: file browser
-            Constraint::Percentage(50), // Right pane: content/details
-        ])
-        .split(chunks[0]);
+    // If we have search results, split the main area into top (file browser) and bottom (search results)
+    if !app.search_results.is_empty() {
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(70), // Top: file browser + content
+                Constraint::Percentage(30), // Bottom: search results
+            ])
+            .split(chunks[0]);
 
-    // Left pane: File browser
-    draw_file_browser(f, app, main_chunks[0]);
+        // Top area: file browser and content panes
+        let top_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50), // Left pane: file browser
+                Constraint::Percentage(50), // Right pane: content/details
+            ])
+            .split(main_chunks[0]);
 
-    // Right pane: Content or details
-    draw_content_pane(f, app, main_chunks[1]);
+        // Left pane: File browser
+        draw_file_browser(f, app, top_chunks[0]);
+
+        // Right pane: Content or details
+        draw_content_pane(f, app, top_chunks[1]);
+
+        // Bottom pane: Search results
+        draw_search_results(f, app, main_chunks[1]);
+    } else {
+        // Normal layout without search results
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50), // Left pane: file browser
+                Constraint::Percentage(50), // Right pane: content/details
+            ])
+            .split(chunks[0]);
+
+        // Left pane: File browser
+        draw_file_browser(f, app, main_chunks[0]);
+
+        // Right pane: Content or details
+        draw_content_pane(f, app, main_chunks[1]);
+    }
 
     // Bottom status bar
     draw_status_bar(f, app, chunks[1]);
+}
+
+pub fn draw_search_results(f: &mut Frame, app: &mut App, area: Rect) {
+    let server_name = if app.is_remote() {
+        if let Some(fs) = app.fs_ops.as_any().downcast_ref::<SftpFileSystem>() {
+            format!("{}@{}:{}", fs.username, fs.remote_host, fs.port)
+        } else {
+            "remote".to_string()
+        }
+    } else {
+        "local".to_string()
+    };
+
+    let items: Vec<ListItem> = app.search_results.iter().enumerate().map(|(i, line)| {
+        let display_line = if i < app.grep_results.len() {
+            // This is a content search result with file path and line number already in the line
+            Line::from(vec![
+                Span::styled(format!("[{}] ", server_name), Style::default().fg(Color::Cyan)),
+                Span::raw(line.spans.iter().map(|s| s.content.clone()).collect::<String>()),
+            ])
+        } else {
+            // This is a name search result
+            Line::from(vec![
+                Span::styled(format!("[{}] ", server_name), Style::default().fg(Color::Cyan)),
+                Span::raw(line.spans.iter().map(|s| s.content.clone()).collect::<String>()),
+            ])
+        };
+
+        ListItem::new(display_line)
+    }).collect();
+
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.focused_pane == FocusedPane::SearchResults {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            })
+            .title(format!("Search Results ({}) - Tab: switch pane, Enter: jump to file", app.search_results.len())))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    f.render_stateful_widget(list, area, &mut app.search_list_state);
 }
 
 fn draw_file_browser(f: &mut Frame, app: &mut App, area: Rect) {

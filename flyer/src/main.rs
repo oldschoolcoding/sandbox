@@ -93,24 +93,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
         terminal.draw(|f| {
             match app.input_mode {
                 InputMode::Normal => {
-                    if !app.search_results.is_empty() && app.focused_pane == FocusedPane::SearchResults {
-                        // Show search results
-                        use ratatui::widgets::{List, ListItem, Block, Borders};
-                        let items: Vec<ListItem> = app.search_results.iter().map(|line| {
-                            ListItem::new(line.clone())
-                        }).collect();
-
-                        let list = List::new(items)
-                            .block(Block::default()
-                                .borders(Borders::ALL)
-                                .title("Search Results (Enter: jump to file | Esc: close)"))
-                            .highlight_style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED));
-
-                        f.render_stateful_widget(list, f.size(), &mut app.search_list_state);
-                    } else {
-                        // Show main file browser UI
-                        ui::draw_main_ui(f, &mut app, f.size());
-                    }
+                    ui::draw_main_ui(f, &mut app, f.size());
                 }
                 InputMode::ConnectionList => {
                     ui::draw_connection_list(f, &mut app, f.size());
@@ -209,10 +192,20 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                             }
                         }
 
+                        // Pane switching
+                        KeyCode::Tab => {
+                            if !app.search_results.is_empty() {
+                                app.focused_pane = match app.focused_pane {
+                                    FocusedPane::FileBrowser => FocusedPane::SearchResults,
+                                    FocusedPane::SearchResults => FocusedPane::FileBrowser,
+                                };
+                            }
+                        }
+
                         // Quit
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if !app.search_results.is_empty() {
-                            app.clear_search();
+                                app.clear_search();
                             } else {
                                 break;
                             }
