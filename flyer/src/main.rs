@@ -1,3 +1,4 @@
+mod ai;
 mod core;
 mod filesystem;
 mod network;
@@ -9,7 +10,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use ratatui::{backend::CrosstermBackend, Terminal, style::Style};
+use ratatui::{backend::CrosstermBackend, Terminal, style::{Style, Color}};
 use crossterm::event::{KeyCode, KeyModifiers};
 use crate::core::app::{App, FocusedPane};
 use crate::core::InputMode;
@@ -28,8 +29,6 @@ fn get_user_friendly_error(error: &AppError) -> String {
         AppError::Ssh(err) => format!("SSH connection error: {}", err),
         AppError::Regex(err) => format!("Search pattern error: {}", err),
         AppError::Serialization(err) => format!("Data error: {}", err),
-        AppError::Encryption(msg) => format!("Security error: {}", msg),
-        AppError::Password(msg) => format!("Authentication error: {}", msg),
     }
 }
 
@@ -42,48 +41,10 @@ async fn main() -> Result<(), crate::core::error::AppError> {
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     
-    app.input_mode = InputMode::Password;
-    
-    loop {
-        terminal.draw(|f| {
-            ui::draw_password_prompt(f, &app, f.size());
-        })?;
-
-        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind != crossterm::event::KeyEventKind::Press {
-                    continue;
-                }
-
-            match app.input_mode {
-                    InputMode::Password => match key.code {
-                        crossterm::event::KeyCode::Char(c) => {
-                            app.password_input.push(c);
-                        }
-                        crossterm::event::KeyCode::Backspace => {
-                            app.password_input.pop();
-                        }
-                        crossterm::event::KeyCode::Enter => {
-                            if app.connection_manager.load(&app.password_input).is_ok() {
-                                app.input_mode = InputMode::Normal;
-                                break;
-        } else {
-                                app.password_input.clear();
-                            }
-                        }
-                        crossterm::event::KeyCode::Esc => {
-                    app.input_mode = InputMode::Normal;
-                    break;
-                }
-                _ => {}
-                            }
-                            _ => {}
-                }
-            }
-        }
+    // Load connections without password
+    if app.connection_manager.load().is_err() {
+        app.status_message = Some("Failed to load connections".into());
     }
-
-    app.password_input.clear();
 
     // Main application loop
     loop {
@@ -108,14 +69,35 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
+                            Constraint::Length(3), // Natural language query field
                             Constraint::Length(3), // Filename regex field
                             Constraint::Length(3), // Content regex field
                             Constraint::Min(0),    // Help text
                         ])
                         .split(f.size());
 
+                    // Natural language query field
+                    let nl_title = if app.search_field_focus == 0 {
+                        "Natural Language Query (focused)"
+                    } else {
+                        "Natural Language Query"
+                    };
+                    let nl_value = if app.natural_language_query.is_empty() {
+                        "_"
+                    } else {
+                        &app.natural_language_query
+                    };
+
+                    let nl_block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(nl_title);
+                    let nl_paragraph = Paragraph::new(nl_value)
+                        .block(nl_block)
+                        .style(Style::default().fg(Color::White));
+                    f.render_widget(nl_paragraph, chunks[0]);
+
                     // Filename regex field
-                    let filename_title = if app.search_field_focus == 0 {
+                    let filename_title = if app.search_field_focus == 1 {
                         "Filename Regex (focused)"
                     } else {
                         "Filename Regex"
@@ -129,15 +111,15 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         .block(Block::default()
                             .borders(Borders::ALL)
                             .title(filename_title)
-                            .border_style(if app.search_field_focus == 0 {
+                            .border_style(if app.search_field_focus == 1 {
                                 ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
                             } else {
                                 ratatui::style::Style::default()
                             }));
-                    f.render_widget(filename_para, chunks[0]);
+                    f.render_widget(filename_para, chunks[1]);
 
                     // Content regex field
-                    let content_title = if app.search_field_focus == 1 {
+                    let content_title = if app.search_field_focus == 2 {
                         "Content Regex (focused)"
         } else {
                         "Content Regex"
@@ -151,18 +133,19 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         .block(Block::default()
                             .borders(Borders::ALL)
                             .title(content_title)
-                            .border_style(if app.search_field_focus == 1 {
+                            .border_style(if app.search_field_focus == 2 {
                                 ratatui::style::Style::default().fg(ratatui::style::Color::Yellow)
                             } else {
                                 ratatui::style::Style::default()
                             }));
-                    f.render_widget(content_para, chunks[1]);
+                    f.render_widget(content_para, chunks[2]);
 
                     // Help text
-                    let help_text = "Tab: switch fields  F1-F4: insert patterns  Ctrl+R: test regex\nEnter: search  Esc: cancel  Backspace: delete";
+                    let provider_name = app.ai_client.get_provider_name();
+                    let help_text = format!("Tab: switch fields  Ctrl+A: AI interpret  Ctrl+P: switch AI provider ({})  F1-F4: patterns\nEnter: search  Esc: cancel  Backspace: delete", provider_name);
                     let help_para = Paragraph::new(help_text)
                         .block(Block::default().borders(Borders::ALL).title("Help"));
-                    f.render_widget(help_para, chunks[2]);
+                    f.render_widget(help_para, chunks[3]);
                 }
                 _ => {
                     ui::draw_main_ui(f, &mut app, f.size());
@@ -281,7 +264,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if !app.search_results.is_empty() {
                                 app.clear_search();
-                    } else {
+        } else {
                                 break;
                             }
                         }
@@ -301,6 +284,9 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
                         KeyCode::Char('a') => {
                             app.start_add_connection();
+                        }
+                        KeyCode::Char('t') => {
+                            app.test_all_connections();
                         }
                         KeyCode::Char('d') => {
                             if let Err(e) = app.delete_selected_connection() {
@@ -335,6 +321,16 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                             // Handle special key combinations
                             if key.modifiers.contains(KeyModifiers::CONTROL) {
                                 match c {
+                                    'a' => {
+                                        // AI interpret natural language query
+                                        app.interpret_natural_language_query();
+                                    }
+                                    'p' => {
+                                        // Switch AI provider
+                                        app.ai_client.switch_provider();
+                                        let provider_name = app.ai_client.get_provider_name();
+                                        app.status_message = Some(format!("Switched to {}", provider_name));
+                                    }
                                     'r' => {
                                         // Test regex (could show matches in a sample)
                                         // For now, just show a message
@@ -344,8 +340,11 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                                 }
         } else {
                                 // Add character to the focused field
-                                if let Some(ref mut config) = app.search_config {
-                                    let field = if app.search_field_focus == 0 {
+                                if app.search_field_focus == 0 {
+                                    // Natural language query
+                                    app.natural_language_query.push(c);
+                                } else if let Some(ref mut config) = app.search_config {
+                                    let field = if app.search_field_focus == 1 {
                                         &mut config.filename_regex
         } else {
                                         &mut config.content_regex
@@ -358,8 +357,11 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                         }
                         KeyCode::Backspace => {
                             // Remove character from the focused field
-                            if let Some(ref mut config) = app.search_config {
-                                let field = if app.search_field_focus == 0 {
+                            if app.search_field_focus == 0 {
+                                // Natural language query
+                                let _ = app.natural_language_query.pop();
+                            } else if let Some(ref mut config) = app.search_config {
+                                let field = if app.search_field_focus == 1 {
                                     &mut config.filename_regex
         } else {
                                     &mut config.content_regex
@@ -370,8 +372,8 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                             }
                         }
                         KeyCode::Tab => {
-                            // Switch between filename and content fields
-                            app.search_field_focus = 1 - app.search_field_focus;
+                            // Switch between natural language, filename, and content fields
+                            app.search_field_focus = (app.search_field_focus + 1) % 3;
                         }
                         KeyCode::F(1) => {
                             // Word boundary pattern
@@ -436,7 +438,7 @@ async fn main() -> Result<(), crate::core::error::AppError> {
                 KeyCode::Enter => {
                     if let Err(e) = app.perform_search() {
                         app.status_message = Some(format!("Search failed: {}", get_user_friendly_error(&e)));
-                        app.input_mode = InputMode::Normal;
+                            app.input_mode = InputMode::Normal;
                     }
                     // perform_search() already sets input_mode to Normal on success
                 }

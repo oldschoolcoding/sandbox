@@ -7,7 +7,7 @@ use ratatui::{
 };
 use std::path::Path;
 use crate::core::app::{App, FocusedPane};
-use crate::network::connection::RemoteConnection;
+use crate::network::connection::{RemoteConnection, ConnectionStatus};
 use crate::filesystem::{SftpFileSystem};
 
 fn get_file_icon_and_color(file_path: &Path, is_dir: bool, is_hidden: bool) -> (&'static str, Color) {
@@ -81,8 +81,23 @@ pub fn draw_connection_list(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = connections
         .iter()
         .map(|c| {
+            let (status_icon, status_color) = match c.status {
+                ConnectionStatus::Unknown => ("○", Color::Gray),
+                ConnectionStatus::Testing => ("⟳", Color::Blue),
+                ConnectionStatus::Valid => ("✓", Color::Green),
+                ConnectionStatus::Invalid => ("✗", Color::Red),
+            };
+
+            let name_color = if c.status == ConnectionStatus::Invalid {
+                Color::Red
+            } else {
+                Color::Cyan
+            };
+
             let line = Line::from(vec![
-                Span::styled(format!("{:20}", c.name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:2}", status_icon), Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(format!("{:18}", c.name), Style::default().fg(name_color).add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled(format!("{}@{}:{}", c.username, c.host, c.port), Style::default().fg(Color::Yellow)),
             ]);
@@ -93,12 +108,12 @@ pub fn draw_connection_list(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title(" Saved Connections (Enter: connect | d: delete | a: add | Esc: cancel) "))
+            .title(" Saved Connections (Enter: connect | t: test all | d: delete | a: add | Esc: cancel) "))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
 
     f.render_stateful_widget(list, chunks[0], &mut app.connection_list_state);
 
-    let help = Paragraph::new("↑↓: navigate | Enter: connect | d: delete | a: add new | Esc: cancel")
+    let help = Paragraph::new("↑↓: navigate | Enter: connect | t: test all | d: delete | a: add new | Esc: cancel")
         .style(Style::default().bg(Color::DarkGray));
     f.render_widget(help, chunks[1]);
 }
@@ -130,14 +145,6 @@ pub fn draw_add_connection(f: &mut Frame, app: &App, area: Rect, step: AddConnec
     f.render_widget(para, area);
 }
 
-pub fn draw_password_prompt(f: &mut Frame, app: &App, area: Rect) {
-    let text = format!("Master Password: {}_", "*".repeat(app.password_input.len()));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Enter Master Password ");
-    let para = Paragraph::new(text).block(block);
-    f.render_widget(para, area);
-}
 
 pub fn draw_main_ui(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -148,48 +155,61 @@ pub fn draw_main_ui(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
-    // If we have search results, split the main area into top (file browser) and bottom (search results)
+    // Main layout: Left pane for connections, Right area for files/content
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(30), // Left pane: connections
+            Constraint::Min(0),     // Right area: files and content
+        ])
+        .split(chunks[0]);
+
+    // Left pane: Connections
+    draw_connection_list(f, app, main_layout[0]);
+
+    // Right area: files, content, and search results
     if !app.search_results.is_empty() {
-        let main_chunks = Layout::default()
+        // Split right area into top (file browser + content) and bottom (search results)
+        let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Percentage(70), // Top: file browser + content
                 Constraint::Percentage(30), // Bottom: search results
             ])
-            .split(chunks[0]);
+            .split(main_layout[1]);
 
         // Top area: file browser and content panes
-        let top_chunks = Layout::default()
+        let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(50), // Left pane: file browser
-                Constraint::Percentage(50), // Right pane: content/details
+                Constraint::Percentage(50), // Left: file browser
+                Constraint::Percentage(50), // Right: content/details
             ])
-            .split(main_chunks[0]);
+            .split(right_chunks[0]);
 
-        // Left pane: File browser
-        draw_file_browser(f, app, top_chunks[0]);
+        // Left: File browser
+        draw_file_browser(f, app, content_chunks[0]);
 
-        // Right pane: Content or details
-        draw_content_pane(f, app, top_chunks[1]);
+        // Right: Content or details
+        draw_content_pane(f, app, content_chunks[1]);
 
-        // Bottom pane: Search results
-        draw_search_results(f, app, main_chunks[1]);
+        // Bottom: Search results
+        draw_search_results(f, app, right_chunks[1]);
     } else {
         // Normal layout without search results
-        let main_chunks = Layout::default()
+        let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(50), // Left pane: file browser
-                Constraint::Percentage(50), // Right pane: content/details
+                Constraint::Percentage(50), // Left: file browser
+                Constraint::Percentage(50), // Right: content/details
             ])
-            .split(chunks[0]);
+            .split(main_layout[1]);
 
-        // Left pane: File browser
-        draw_file_browser(f, app, main_chunks[0]);
+        // Left: File browser
+        draw_file_browser(f, app, content_chunks[0]);
 
-        // Right pane: Content or details
-        draw_content_pane(f, app, main_chunks[1]);
+        // Right: Content or details
+        draw_content_pane(f, app, content_chunks[1]);
     }
 
     // Bottom status bar

@@ -76,14 +76,14 @@ pub async fn perform_remote_search_async(
                 if check_command_available(&session, "rg") {
                     let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
                     format!(
-                        "cd '{}' && rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
-                        current_path_str, content_regex
+                        "rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}' '{}'",
+                        content_regex, current_path_str
                     )
                 } else if check_command_available(&session, "grep") {
                     let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
                     format!(
-                        "cd '{}' && grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
-                        current_path_str, content_regex
+                        "grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}' '{}'",
+                        content_regex, current_path_str
                     )
                 } else {
                     let _ = tx.send(SearchResult::Error("Neither ripgrep nor grep found on remote server.".into()));
@@ -97,9 +97,11 @@ pub async fn perform_remote_search_async(
             // Filename search - use fd/find
             if check_command_available(&session, "fd") {
                 let _ = tx.send(SearchResult::Status("Using fd for filename search".into()));
-                format!("cd '{}' && fd -t f --regex '{}'", current_path_str, filename_regex)
+                format!("fd -t f '{}' '{}'", filename_regex, current_path_str)
             } else {
                 let _ = tx.send(SearchResult::Status("Using find for filename search".into()));
+                // For find with regex, we need to match the entire path but focus on filename
+                // This pattern matches any file whose name contains the regex
                 format!("find '{}' -type f -regextype posix-extended -regex '.*/.*{}.*'", current_path_str, filename_regex)
             }
         }
@@ -112,14 +114,14 @@ pub async fn perform_remote_search_async(
         if check_command_available(&session, "rg") {
             let _ = tx.send(SearchResult::Status("Using ripgrep for content search".into()));
             format!(
-                "cd '{}' && rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}'",
-                current_path_str, content_regex
+                "rg --line-number --binary-files=without-match --hidden --glob '!.git' --glob '!.svn' --glob '!.hg' '{}' '{}'",
+                content_regex, current_path_str
             )
         } else if check_command_available(&session, "grep") {
             let _ = tx.send(SearchResult::Status("Using grep for content search".into()));
             format!(
-                "cd '{}' && grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}'",
-                current_path_str, content_regex
+                "grep -r -n -I --binary-files=without-match --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg '{}' '{}'",
+                content_regex, current_path_str
             )
         } else {
             let _ = tx.send(SearchResult::Error("Neither ripgrep nor grep found on remote server.".into()));
@@ -142,6 +144,9 @@ pub async fn perform_remote_search_async(
             return;
         }
     };
+
+    let _ = tx.send(SearchResult::Command(cmd_str.clone()));
+    let _ = tx.send(SearchResult::Status(format!("Executing: {}", cmd_str)));
 
     match channel.exec(&cmd_str) {
         Ok(_) => {},
@@ -298,4 +303,125 @@ fn parse_grep_line(line: &str) -> Option<(String, usize, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_search_config_creation() {
+        let config = SearchConfig {
+            filename_regex: Some("test".to_string()),
+            content_regex: None,
+        };
+
+        assert_eq!(config.filename_regex, Some("test".to_string()));
+        assert_eq!(config.content_regex, None);
+    }
+
+    #[test]
+    fn test_filename_search_config() {
+        let config = SearchConfig {
+            filename_regex: Some("*.rs".to_string()),
+            content_regex: None,
+        };
+
+        assert!(config.filename_regex.is_some());
+        assert!(config.content_regex.is_none());
+        assert!(!config.filename_regex.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_content_search_config() {
+        let config = SearchConfig {
+            filename_regex: None,
+            content_regex: Some("function".to_string()),
+        };
+
+        assert!(config.filename_regex.is_none());
+        assert!(config.content_regex.is_some());
+        assert!(!config.content_regex.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_combined_search_config() {
+        let config = SearchConfig {
+            filename_regex: Some("*.txt".to_string()),
+            content_regex: Some("error".to_string()),
+        };
+
+        assert!(config.filename_regex.is_some());
+        assert!(config.content_regex.is_some());
+    }
+
+    #[test]
+    fn test_search_config_validation() {
+        // Test empty filename should be considered None
+        let config = SearchConfig {
+            filename_regex: Some("".to_string()),
+            content_regex: None,
+        };
+        assert_eq!(config.filename_regex.as_ref().unwrap().is_empty(), true);
+
+        // Test empty content should be considered None
+        let config = SearchConfig {
+            filename_regex: None,
+            content_regex: Some("".to_string()),
+        };
+        assert_eq!(config.content_regex.as_ref().unwrap().is_empty(), true);
+
+        // Test valid non-empty values
+        let config = SearchConfig {
+            filename_regex: Some("test".to_string()),
+            content_regex: Some("function".to_string()),
+        };
+        assert!(!config.filename_regex.as_ref().unwrap().is_empty());
+        assert!(!config.content_regex.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_search_criteria_validation() {
+        // This mimics the validation logic from perform_search
+
+        // Test filename-only search
+        let config = SearchConfig {
+            filename_regex: Some("*.rs".to_string()),
+            content_regex: None,
+        };
+        let has_filename_criteria = config.filename_regex.as_ref().map_or(false, |s| !s.is_empty());
+        let has_content_criteria = config.content_regex.as_ref().map_or(false, |s| !s.is_empty());
+        assert!(has_filename_criteria);
+        assert!(!has_content_criteria);
+
+        // Test content-only search
+        let config = SearchConfig {
+            filename_regex: None,
+            content_regex: Some("function".to_string()),
+        };
+        let has_filename_criteria = config.filename_regex.as_ref().map_or(false, |s| !s.is_empty());
+        let has_content_criteria = config.content_regex.as_ref().map_or(false, |s| !s.is_empty());
+        assert!(!has_filename_criteria);
+        assert!(has_content_criteria);
+
+        // Test combined search
+        let config = SearchConfig {
+            filename_regex: Some("*.txt".to_string()),
+            content_regex: Some("error".to_string()),
+        };
+        let has_filename_criteria = config.filename_regex.as_ref().map_or(false, |s| !s.is_empty());
+        let has_content_criteria = config.content_regex.as_ref().map_or(false, |s| !s.is_empty());
+        assert!(has_filename_criteria);
+        assert!(has_content_criteria);
+
+        // Test invalid search (no criteria)
+        let config = SearchConfig {
+            filename_regex: Some("".to_string()),
+            content_regex: None,
+        };
+        let has_filename_criteria = config.filename_regex.as_ref().map_or(false, |s| !s.is_empty());
+        let has_content_criteria = config.content_regex.as_ref().map_or(false, |s| !s.is_empty());
+        assert!(!has_filename_criteria);
+        assert!(!has_content_criteria);
+    }
 }

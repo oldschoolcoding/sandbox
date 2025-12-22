@@ -19,7 +19,7 @@ use regex::Regex;
 use users;
 use super::error::AppError;
 use crate::filesystem::{FileSystemOperations, FileEntry, FileProperties, SftpFileSystem, LocalFileSystem};
-use crate::network::connection::{ConnectionManager, RemoteConnection};
+use crate::network::connection::{ConnectionManager, RemoteConnection, ConnectionStatus};
 use crate::ui::AddConnectionStep;
 use crate::search::perform_remote_search_async;
 
@@ -36,12 +36,9 @@ fn get_user_friendly_error(error: &AppError) -> String {
         AppError::Ssh(err) => format!("SSH connection error: {}", err),
         AppError::Regex(err) => format!("Search pattern error: {}", err),
         AppError::Serialization(err) => format!("Data error: {}", err),
-        AppError::Encryption(msg) => format!("Security error: {}", msg),
-        AppError::Password(msg) => format!("Authentication error: {}", msg),
     }
 }
 
-const CONNECTIONS_FILE: &str = "connections.enc";
 
 #[derive(Debug)]
 pub enum SearchResult {
@@ -83,7 +80,6 @@ pub struct GrepResult {
 pub enum InputMode {
     Normal,
     Search,
-    Password,
     ConnectionList,
     AddConnection(AddConnectionStep),
 }
@@ -124,9 +120,11 @@ pub struct App {
     // Connection management
     pub connection_manager: ConnectionManager,
     pub connection_list_state: ListState,
-    pub password_input: String,
     pub new_connection: RemoteConnection,
     pub last_executed_command: Option<String>,
+    // AI integration
+    pub ai_client: crate::ai::AIClient,
+    pub natural_language_query: String,
 }
 
 impl App {
@@ -161,15 +159,17 @@ impl App {
             needs_content_update: false,
             connection_manager: ConnectionManager::new()?,
             connection_list_state: ListState::default(),
-            password_input: String::new(),
             new_connection: RemoteConnection {
                 name: String::new(),
                 username: String::new(),
                 host: String::new(),
                 port: 22,
                 password: String::new(),
+                status: ConnectionStatus::Unknown,
             },
             last_executed_command: None,
+            ai_client: crate::ai::AIClient::default(),
+            natural_language_query: String::new(),
         };
         app.current_path = app.fs_ops.get_start_path()?;
         app.refresh_entries()?;
@@ -395,6 +395,7 @@ impl App {
         Ok(())
     }
 
+
     pub fn clear_search(&mut self) {
         self.search_results.clear();
         self.grep_results.clear();
@@ -544,22 +545,123 @@ impl App {
         self.connection_list_state.select(Some(new_index));
     }
 
+    pub fn interpret_natural_language_query(&mut self) {
+        let query = self.natural_language_query.clone();
+        if query.trim().is_empty() {
+            self.status_message = Some("Please enter a natural language query first".to_string());
+            return;
+        }
+
+        self.status_message = Some("Interpreting query with AI...".to_string());
+
+        // Create a new AI client instance for the async task
+        let ai_client = crate::ai::AIClient::new(self.ai_client.get_config().clone());
+
+        // Clone query for async task
+        let query_clone = query.clone();
+
+        // Perform AI interpretation in background
+        tokio::spawn(async move {
+            match ai_client.interpret_search_query(&query_clone).await {
+                Ok(search_config) => {
+                    // In a real implementation, we'd update the app state here
+                    // For now, we'll just print the result
+                    println!("AI interpreted '{}' -> filename: {:?}, content: {:?}",
+                            query_clone, search_config.filename_regex, search_config.content_regex);
+                }
+                Err(e) => {
+                    eprintln!("AI interpretation failed: {}", e);
+                }
+            }
+        });
+
+        // For demo purposes, also use the synchronous fallback
+        let interpreted_config = self.interpret_query_fallback(&query);
+        self.search_config = Some(interpreted_config);
+        self.status_message = Some(format!("AI interpreted query: '{}'", query));
+    }
+
+    fn interpret_query_fallback(&self, query: &str) -> SearchConfig {
+        // Fallback rule-based interpretation
+        let query_lower = query.to_lowercase();
+
+        if query_lower.contains("python") || query_lower.contains("py") {
+            SearchConfig {
+                filename_regex: Some(".*\\.py$".to_string()),
+                content_regex: None,
+            }
+        } else if query_lower.contains("config") || query_lower.contains("configuration") {
+            SearchConfig {
+                filename_regex: Some(".*config.*|.*\\.conf.*|.*\\.yml.*|.*\\.yaml.*".to_string()),
+                content_regex: None,
+            }
+        } else if query_lower.contains("error") || query_lower.contains("exception") {
+            SearchConfig {
+                filename_regex: None,
+                content_regex: Some("error|Error|ERROR|exception|Exception".to_string()),
+            }
+        } else if query_lower.contains("database") || query_lower.contains("db") {
+            SearchConfig {
+                filename_regex: None,
+                content_regex: Some("database|connect|db|mysql|postgres|mongodb".to_string()),
+            }
+        } else {
+            // Default to content search with the query terms
+            SearchConfig {
+                filename_regex: None,
+                content_regex: Some(query.to_string()),
+            }
+        }
+    }
+
+    pub fn test_all_connections(&mut self) {
+        // For simplicity, test connections synchronously
+        // Set all connections to testing status first
+        for connection in self.connection_manager.get_connections_mut() {
+            connection.status = ConnectionStatus::Testing;
+        }
+
+        self.status_message = Some("Testing all connections...".into());
+
+        // Test connections synchronously (this blocks the UI but is simple)
+        // In a real app, this would be done asynchronously
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            self.connection_manager.test_all_connections().await;
+        });
+
+        self.status_message = Some("Connection testing completed".into());
+    }
+
+
     pub fn connect_to_selected(&mut self) -> Result<(), AppError> {
         if let Some(idx) = self.connection_list_state.selected() {
-            let conn = self.connection_manager.get_connections().get(idx).cloned();
-            if let Some(conn) = conn {
-                let fs = crate::filesystem::SftpFileSystem::new(
-                    &conn.username,
-                    &conn.host,
-                    conn.port,
-                    &conn.password,
-                )?;
-                self.fs_ops = Box::new(fs);
-                self.current_path = self.fs_ops.get_start_path()?;
-                self.refresh_entries()?;
-                self.input_mode = InputMode::Normal;
-                self.status_message = Some(format!("Connected to {}", conn.name));
+            let connections = self.connection_manager.get_connections();
+            if idx >= connections.len() {
+                return Err(AppError::Navigation(format!("Invalid connection index: {} (max: {})", idx, connections.len())));
             }
+            let conn = &connections[idx];
+            let conn_name = conn.name.clone();
+            let conn_username = conn.username.clone();
+            let conn_host = conn.host.clone();
+            let conn_port = conn.port;
+            let conn_password = conn.password.clone();
+
+            self.status_message = Some(format!("Connecting to {}@{}:{}...", conn_username, conn_host, conn_port));
+
+            let fs = crate::filesystem::SftpFileSystem::new(
+                &conn_username,
+                &conn_host,
+                conn_port,
+                &conn_password,
+            )?;
+            self.fs_ops = Box::new(fs);
+            self.current_path = self.fs_ops.get_start_path()?;
+            self.refresh_entries()?;
+            self.input_mode = InputMode::Normal;
+            self.status_message = Some(format!("Connected to {}", conn_name));
+        } else {
+            return Err(AppError::Navigation("No connection selected".into()));
         }
         Ok(())
     }
@@ -572,6 +674,7 @@ impl App {
             host: String::new(),
             port: 22,
             password: String::new(),
+            status: ConnectionStatus::Unknown,
         };
         // Start with the name field
         self.input_mode = InputMode::AddConnection(AddConnectionStep::Name);

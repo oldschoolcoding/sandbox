@@ -13,8 +13,4 @@ pub enum AppError {
     Navigation(String),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error("Encryption error: {0}")]
-    Encryption(String),
-    #[error("Password error: {0}")]
-    Password(String),
 }
