@@ -2,10 +2,17 @@
 name = "xml-extract"
 version = "0.1.0"
 edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "Extract XML documents from logs, supports compressed input and progress bar"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 quick-xml = "0.31"
 regex = "1.10"
+indicatif = "0.18"
+flate2 = "1.0"   # gzip support
+bzip2 = "0.4"    # bzip2 support
+xz2 = "0.1"      # xz support
 

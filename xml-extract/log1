@@ -1,5 +1,45 @@
-lkjlakdsj <ff></ff>
+2026-02-08 12:00:01 INFO Starting process...
+Some random log text before XML
 
-lkjlkj
+2026-02-08 12:00:02 DEBUG <msg id="1"><text>Hello</text></msg>
+2026-02-08 12:00:02 DEBUG Another debug message
 
-<toto>dd</toto>
+2026-02-08 12:00:03 INFO <root>
+    <child>Value1</child>
+</root>
+2026-02-08 12:00:03 INFO System ready
+
+2026-02-08 12:00:04 WARN <note/>
+2026-02-08 12:00:04 INFO Checkpoint reached
+
+2026-02-08 12:00:05 ERROR <message id="2">
+    <header timestamp="2026-02-08T12:00:05Z"/>
+    <body>Something happened</body>
+</message>
+2026-02-08 12:00:05 DEBUG Continuing
+
+2026-02-08 12:00:06 INFO Normal log line
+2026-02-08 12:00:06 INFO <ns:tag xmlns:ns="http://example.com/ns"><ns:data>42</ns:data></ns:tag>
+
+2026-02-08 12:00:07 INFO Random text
+2026-02-08 12:00:07 INFO <event type="start"><details>Task started</details></event>
+
+2026-02-08 12:00:08 INFO Something else
+2026-02-08 12:00:08 INFO <singleline attr="value"/>
+
+2026-02-08 12:00:09 INFO Another log line
+2026-02-08 12:00:09 DEBUG <mixed>
+    <inner>First</inner><inner>Second</inner>
+</mixed>
+
+2026-02-08 12:00:10 INFO Noise log
+2026-02-08 12:00:10 WARN <container>
+    <item id="a"/>
+    <item id="b"/>
+</container>
+
+2026-02-08 12:00:11 INFO Yet more text
+2026-02-08 12:00:11 INFO <broken><unclosed></broken> Some text after
+
+2026-02-08 12:00:12 INFO End of sequence
+
